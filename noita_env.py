@@ -1,89 +1,147 @@
-import gymnasium as gym
-import numpy as np
+"""
+Gymnasium environment bridging Python ↔ Noita via WebSocket.
+
+Observation (20 float32, all in [0, 1]):
+  [0..15]  16 RaytracePlatforms sensors (0=wall at player, 1=150px clear)
+  [16]     hp fraction
+  [17]     vx normalised  (−200..+200 → 0..1)
+  [18]     vy normalised
+  [19]     on_ground
+
+Actions (Discrete 5):  0=idle  1=left  2=right  3=jump  4=fire
+"""
+
+from __future__ import annotations
+
 import asyncio
 import json
-import websockets
 import threading
 import time
+from typing import Any, Optional
+
+import numpy as np
+import websockets
+import gymnasium as gym
+from loguru import logger
 
 
 class NoitaEnv(gym.Env):
-    """
-    Gymnasium env wrapping Noita via WebSocket.
-
-    Observation (20 floats, all in [0, 1]):
-        [0..15]  16 raytrace sensors (0=wall touching, 1=150px clear)
-        [16]     hp fraction
-        [17]     vx normalised  (-200..+200 → 0..1)
-        [18]     vy normalised
-        [19]     on_ground (0 or 1)
-
-    Actions (Discrete 5):
-        0=idle  1=left  2=right  3=jump  4=fire
-    """
-
     metadata = {"render_modes": ["human"]}
 
-    def __init__(self, host="localhost", port=5001):
+    # ── Construction ──────────────────────────────────────────────────────────
+
+    def __init__(self, host: str = "localhost", port: int = 5001):
         super().__init__()
-        self.action_space      = gym.spaces.Discrete(5)
+        self.host = host
+        self.port = port
+
+        self.action_space = gym.spaces.Discrete(5)
         self.observation_space = gym.spaces.Box(
             low=0.0, high=1.0, shape=(20,), dtype=np.float32
         )
 
-        self.host = host
-        self.port = port
-
-        self.websocket     = None
-        self.current_state = None   # dict written by WS thread, read by main thread
-        self.loop          = None
+        # WebSocket state (written by WS thread, read by main thread)
+        self._ws:    Optional[Any]  = None
+        self._state: Optional[dict] = None
+        self._lock   = threading.Lock()   # guards _ws + _state
+        self._loop:  Optional[asyncio.AbstractEventLoop] = None
 
         # Episode stats
-        self.episode_num     = 0
-        self.episode_steps   = 0
-        self.episode_reward  = 0.0
-        self.last_hp         = 1.0
-        self.max_depth_y     = 0.0   # largest Y seen (Noita: +Y = deeper underground)
+        self.episode_num    = 0
+        self.episode_steps  = 0
+        self.episode_reward = 0.0
+        self.last_hp        = 1.0
+        self.max_depth_y    = 0.0
 
-        self._server_thread = threading.Thread(target=self._run_server, daemon=True)
-        self._server_thread.start()
-        print(f"[NoitaEnv] WebSocket server started — waiting for Noita on {host}:{port}")
+        self._start_server()
+        logger.info("[env:{}] WebSocket server on {}:{}", port, host, port)
 
-    # ── WebSocket server ──────────────────────────────────────────────────
+    # ── WebSocket server ──────────────────────────────────────────────────────
 
-    def _run_server(self):
-        self.loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self.loop)
-        async def _main():
-            async with websockets.serve(self._handle, self.host, self.port):
-                await asyncio.Future()
-        self.loop.run_until_complete(_main())
+    def _start_server(self) -> None:
+        ready = threading.Event()
 
-    async def _handle(self, websocket):
-        print("[NoitaEnv] Noita connected!")
-        self.websocket = websocket
+        def _run() -> None:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            self._loop = loop
+
+            async def _serve() -> None:
+                async with websockets.serve(self._handle, self.host, self.port):
+                    ready.set()
+                    await asyncio.Future()   # run forever
+
+            loop.run_until_complete(_serve())
+
+        t = threading.Thread(target=_run, daemon=True, name=f"ws-{self.port}")
+        t.start()
+        ready.wait(timeout=5)
+
+    async def _handle(self, ws) -> None:
+        addr = ws.remote_address
+        logger.info("[env:{}] Noita connected from {}", self.port, addr)
+        with self._lock:
+            self._ws = ws
         try:
-            async for raw in websocket:
-                self.current_state = json.loads(raw)
-        except websockets.exceptions.ConnectionClosed:
-            print("[NoitaEnv] Noita disconnected.")
-            self.websocket     = None
-            self.current_state = None
+            async for raw in ws:
+                try:
+                    state = json.loads(raw)
+                    with self._lock:
+                        self._state = state
+                except json.JSONDecodeError as exc:
+                    logger.warning("[env:{}] Bad JSON from Noita: {}", self.port, exc)
+        except websockets.exceptions.ConnectionClosed as exc:
+            logger.warning("[env:{}] Noita disconnected: {}", self.port, exc)
+        finally:
+            with self._lock:
+                if self._ws is ws:
+                    self._ws    = None
+                    self._state = None
 
-    # ── Observation ───────────────────────────────────────────────────────
+    # ── Helpers ───────────────────────────────────────────────────────────────
 
-    def _get_obs(self):
-        s = self.current_state
-        if s is None:
+    def _send_action(self, action: int) -> None:
+        with self._lock:
+            ws   = self._ws
+            loop = self._loop
+        if ws is None or loop is None:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                ws.send(json.dumps(action)), loop
+            ).result(timeout=0.2)
+        except Exception as exc:
+            logger.debug("[env:{}] send_action failed: {}", self.port, exc)
+
+    def _get_state(self) -> Optional[dict]:
+        with self._lock:
+            return self._state
+
+    def _wait_for_live_state(self, timeout: float = 30.0) -> bool:
+        """Block until a non-dead state arrives from Noita, or timeout."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            s = self._get_state()
+            if s is not None and not s.get("dead", False):
+                return True
+            time.sleep(0.1)
+        return False
+
+    def _obs_from_state(self, state: Optional[dict]) -> np.ndarray:
+        if state is None:
             return np.zeros(20, dtype=np.float32)
-        vx  = float(np.clip(s.get("vx", 0) / 200.0, -1, 1)) * 0.5 + 0.5
-        vy  = float(np.clip(s.get("vy", 0) / 200.0, -1, 1)) * 0.5 + 0.5
-        gnd = 1.0 if s.get("on_ground", False) else 0.0
-        return np.array(s["rays"] + [s["hp"], vx, vy, gnd], dtype=np.float32)
+        vx  = float(np.clip(state.get("vx", 0.0) / 200.0, -1.0, 1.0)) * 0.5 + 0.5
+        vy  = float(np.clip(state.get("vy", 0.0) / 200.0, -1.0, 1.0)) * 0.5 + 0.5
+        gnd = 1.0 if state.get("on_ground", False) else 0.0
+        rays = state.get("rays", [1.0] * 16)
+        if len(rays) != 16:
+            logger.warning("[env:{}] Expected 16 rays, got {}", self.port, len(rays))
+            rays = (rays + [1.0] * 16)[:16]
+        return np.array(rays + [state.get("hp", 1.0), vx, vy, gnd], dtype=np.float32)
 
-    # ── Reset ─────────────────────────────────────────────────────────────
+    # ── Gymnasium interface ───────────────────────────────────────────────────
 
-    def reset(self, seed=None, options=None):
+    def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
         self.episode_num    += 1
         self.episode_steps   = 0
@@ -91,62 +149,49 @@ class NoitaEnv(gym.Env):
         self.last_hp         = 1.0
         self.max_depth_y     = 0.0
 
-        print(f"[NoitaEnv] reset() — episode {self.episode_num}, waiting for live state...")
-        # Lua already respawned the player; wait for a non-dead state
-        deadline = time.time() + 30.0
-        while True:
-            s = self.current_state
-            if s is not None and not s.get("dead", False):
-                break
-            if time.time() > deadline:
-                print("[NoitaEnv] WARNING: reset() timed out — is Noita running?")
-                break
-            time.sleep(0.1)
+        logger.debug("[env:{}] reset() — episode {}", self.port, self.episode_num)
 
-        if self.current_state:
-            self.last_hp     = self.current_state.get("hp", 1.0)
-            self.max_depth_y = self.current_state.get("y", 0.0)
+        if not self._wait_for_live_state(timeout=60.0):
+            logger.error("[env:{}] reset() timed out — is Noita running?", self.port)
 
-        print(f"[NoitaEnv] Episode {self.episode_num} started.")
-        return self._get_obs(), {}
+        s = self._get_state()
+        if s:
+            self.last_hp     = s.get("hp", 1.0)
+            self.max_depth_y = s.get("y", 0.0)
 
-    # ── Step ──────────────────────────────────────────────────────────────
+        return self._obs_from_state(s), {}
 
-    def step(self, action):
-        # Send chosen action to Noita
-        if self.websocket and self.loop:
-            asyncio.run_coroutine_threadsafe(
-                self.websocket.send(json.dumps(int(action))),
-                self.loop,
-            )
+    def step(self, action: int):
+        self._send_action(int(action))
+        time.sleep(0.05)      # ~3 Noita frames at 60 fps
 
-        time.sleep(0.05)   # wait ~3 Noita frames for the action to take effect
+        state = self._get_state()
 
-        if self.current_state is None:
-            return self._get_obs(), 0.0, False, False, {}
+        if state is None:
+            # Noita disconnected — return zeros, keep episode going
+            logger.debug("[env:{}] step() with no state (disconnected?)", self.port)
+            return self._obs_from_state(None), 0.0, False, False, {}
 
-        s          = self.current_state
-        current_y  = s.get("y",  0.0)
-        current_hp = s.get("hp", 0.0)
-        dead       = s.get("dead", False)
+        current_y  = state.get("y",  0.0)
+        current_hp = state.get("hp", 0.0)
+        dead       = state.get("dead", False)
 
-        # ── Reward ────────────────────────────────────────────────────────
+        # ── Reward ────────────────────────────────────────────────────────────
         reward = 0.0
 
-        # 1. Survival: small constant reward for staying alive
+        # Survival bonus
         reward += 0.01
 
-        # 2. Depth progress: one-time bonus for reaching a new depth record
-        #    (Noita Y axis: positive = deeper underground)
+        # New depth record (Noita +Y = deeper underground)
         if current_y > self.max_depth_y:
             reward += (current_y - self.max_depth_y) * 0.3
             self.max_depth_y = current_y
 
-        # 3. Damage penalty: proportional to HP lost this step
+        # Damage penalty (proportional)
         if current_hp < self.last_hp:
             reward -= (self.last_hp - current_hp) * 10.0
 
-        # 4. Death penalty
+        # Death penalty
         if dead:
             reward -= 2.0
 
@@ -155,19 +200,22 @@ class NoitaEnv(gym.Env):
         self.episode_reward += reward
 
         if dead:
-            print(
-                f"[NoitaEnv] Ep {self.episode_num:3d} done — "
-                f"steps={self.episode_steps:5d}  "
-                f"reward={self.episode_reward:8.2f}  "
-                f"max_depth={self.max_depth_y:.0f}"
+            logger.info(
+                "[env:{}] Ep {:3d} done — steps={} reward={:.2f} max_depth={:.0f}",
+                self.port, self.episode_num, self.episode_steps,
+                self.episode_reward, self.max_depth_y,
             )
-            # Clear state so reset() waits for a fresh one from the respawned player
-            self.current_state = None
+            # SB3 needs episode info in the info dict for its internal buffers
+            info = {"episode": {"r": self.episode_reward, "l": self.episode_steps}}
+            with self._lock:
+                self._state = None   # force reset() to wait for fresh state
+            return self._obs_from_state(state), reward, True, False, info
 
-        return self._get_obs(), reward, dead, False, {}
+        return self._obs_from_state(state), reward, False, False, {}
 
-    def render(self):
+    def render(self) -> None:
         pass
 
-    def close(self):
-        pass
+    def close(self) -> None:
+        with self._lock:
+            self._ws = None

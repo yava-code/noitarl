@@ -1,0 +1,96 @@
+"""
+Run a saved model against Noita in deterministic mode (no exploration).
+Good for recording YouTube footage of the trained agent.
+
+Usage:
+    python eval.py noita_ppo_final.zip
+    python eval.py checkpoints/noita_ppo_200000_steps.zip --episodes 20
+    python eval.py model.zip --slow 0.5   # run at 50% speed (sleep 50ms between steps)
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+
+from loguru import logger
+from rich.console import Console
+from rich.table import Table
+from stable_baselines3 import PPO
+
+from noita_env import NoitaEnv
+from config import Config
+
+console = Console()
+
+
+def evaluate(model_path: str, n_episodes: int, port: int, step_delay: float) -> None:
+    cfg = Config()
+
+    logger.remove()
+    logger.add(sys.stderr, level="INFO",
+               format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <level>{message}</level>")
+
+    console.rule(f"[bold cyan]NoitaRL Evaluation — {model_path}")
+    console.print(f"  Episodes:   [cyan]{n_episodes}[/]")
+    console.print(f"  Port:       [cyan]{port}[/]")
+    console.print(f"  Step delay: [cyan]{step_delay*1000:.0f} ms[/]")
+    console.rule()
+
+    env = NoitaEnv(host=cfg.noita_host, port=port)
+
+    logger.info("Loading model from {}", model_path)
+    model = PPO.load(model_path, env=env)
+
+    ep_rewards = []
+    ep_lengths = []
+    ep_depths  = []
+
+    for ep in range(1, n_episodes + 1):
+        obs, _ = env.reset()
+        done   = False
+        total_r = 0.0
+        steps   = 0
+
+        while not done:
+            action, _ = model.predict(obs, deterministic=True)
+            obs, r, done, _, _ = env.step(int(action))
+            total_r += r
+            steps   += 1
+            if step_delay > 0:
+                time.sleep(step_delay)
+
+        ep_rewards.append(total_r)
+        ep_lengths.append(steps)
+        ep_depths.append(env.max_depth_y)
+        logger.info("Ep {:3d}: reward={:8.2f}  steps={:5d}  max_depth={:.0f}",
+                    ep, total_r, steps, env.max_depth_y)
+
+    # Summary table
+    import numpy as np
+    t = Table(title=f"Evaluation summary — {n_episodes} episodes", style="dim")
+    t.add_column("Metric",    style="cyan")
+    t.add_column("Mean",      style="green")
+    t.add_column("Std",       style="yellow")
+    t.add_column("Min",       style="red")
+    t.add_column("Max",       style="green")
+    for label, vals in [("Reward", ep_rewards), ("Length", ep_lengths), ("Max depth", ep_depths)]:
+        a = np.array(vals, dtype=float)
+        t.add_row(label, f"{a.mean():.2f}", f"{a.std():.2f}", f"{a.min():.2f}", f"{a.max():.2f}")
+    console.print(t)
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="NoitaRL evaluation / YouTube recording mode")
+    p.add_argument("model",      type=str,               help="Path to .zip model")
+    p.add_argument("--episodes", type=int, default=10,   help="Number of episodes to run")
+    p.add_argument("--port",     type=int, default=5001, help="Noita WebSocket port")
+    p.add_argument("--slow",     type=float, default=0.0,
+                   help="Extra delay per step in seconds (e.g. 0.1 for slow-mo)")
+    return p.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    evaluate(args.model, args.episodes, args.port, args.slow)

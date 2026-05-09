@@ -1,54 +1,180 @@
+"""
+Single-env training entry point.
+For multi-env see train_multi.py.
+
+Usage:
+    python train.py
+    python train.py --resume checkpoints/noita_ppo_200000_steps.zip
+    python train.py --name "experiment-01"
+"""
+
+from __future__ import annotations
+
+import argparse
 import os
+import sys
+import time
+
+from loguru import logger
+from rich.console import Console
 from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import CheckpointCallback
+from stable_baselines3.common.callbacks import CallbackList, CheckpointCallback
+
+from callbacks import NoitaMonitorCallback
+from config import Config
 from noita_env import NoitaEnv
+from notify import TelegramNotifier
+
+console = Console()
 
 
-def train():
-    os.makedirs("checkpoints", exist_ok=True)
+def setup_logging(cfg: Config, run_name: str) -> None:
+    os.makedirs(cfg.log_dir, exist_ok=True)
+    logger.remove()
+    logger.add(
+        sys.stderr,
+        level=cfg.log_level,
+        format=(
+            "<green>{time:HH:mm:ss}</green> | "
+            "<level>{level: <8}</level> | "
+            "<cyan>{name}</cyan>:<cyan>{function}</cyan> — "
+            "<level>{message}</level>"
+        ),
+        colorize=True,
+    )
+    logger.add(
+        os.path.join(cfg.log_dir, f"{run_name}.log"),
+        level="DEBUG",
+        rotation="100 MB",
+        compression="zip",
+        encoding="utf-8",
+    )
+    logger.info("Logging initialised → {}/{}.log", cfg.log_dir, run_name)
 
-    print("[Train] Initialising NoitaEnv...")
-    env = NoitaEnv()
 
-    # Save a checkpoint every 100 000 steps so training can be resumed
+def setup_wandb(cfg: Config, run_name: str) -> None:
+    if not cfg.wandb_enabled:
+        return
+    try:
+        import wandb
+        wandb.init(
+            project=cfg.wandb_project,
+            entity=cfg.wandb_entity or None,
+            name=run_name,
+            config={
+                "total_timesteps": cfg.total_timesteps,
+                "n_envs":          cfg.n_envs,
+                "learning_rate":   cfg.learning_rate,
+                "n_steps":         cfg.n_steps,
+                "batch_size":      cfg.batch_size,
+                "gamma":           cfg.gamma,
+            },
+            sync_tensorboard=True,
+        )
+        logger.info("W&B run started: {}/{}", cfg.wandb_project, run_name)
+    except Exception as exc:
+        logger.warning("W&B init failed (continuing without it): {}", exc)
+
+
+def train(args: argparse.Namespace) -> None:
+    cfg = Config()
+    if args.resume:
+        cfg.resume_from = args.resume
+    if args.name:
+        cfg.run_name = args.name
+
+    run_name = cfg.effective_run_name()
+    setup_logging(cfg, run_name)
+    setup_wandb(cfg, run_name)
+
+    os.makedirs(cfg.checkpoint_dir, exist_ok=True)
+    os.makedirs(cfg.tensorboard_dir, exist_ok=True)
+
+    # ── Notifier ──────────────────────────────────────────────────────────────
+    notifier = TelegramNotifier(cfg.telegram_token, cfg.telegram_chat_id)
+    notifier.start_polling()
+
+    # ── Environment ───────────────────────────────────────────────────────────
+    logger.info("Creating NoitaEnv on port {}", cfg.noita_base_port)
+    env = NoitaEnv(host=cfg.noita_host, port=cfg.noita_base_port)
+
+    # ── Model ─────────────────────────────────────────────────────────────────
+    if cfg.resume_from:
+        logger.info("Resuming from {}", cfg.resume_from)
+        model = PPO.load(cfg.resume_from, env=env, tensorboard_log=cfg.tensorboard_dir)
+    else:
+        model = PPO(
+            "MlpPolicy",
+            env,
+            verbose          = 1,
+            learning_rate    = cfg.learning_rate,
+            n_steps          = cfg.n_steps,
+            batch_size       = cfg.batch_size,
+            n_epochs         = cfg.n_epochs,
+            gamma            = cfg.gamma,
+            gae_lambda       = cfg.gae_lambda,
+            clip_range       = cfg.clip_range,
+            tensorboard_log  = cfg.tensorboard_dir,
+        )
+
+    # ── Callbacks ─────────────────────────────────────────────────────────────
+    monitor_cb = NoitaMonitorCallback(cfg, notifier, verbose=0)
+
     checkpoint_cb = CheckpointCallback(
-        save_freq   = 100_000,
-        save_path   = "./checkpoints/",
-        name_prefix = "noita_ppo",
+        save_freq   = max(cfg.checkpoint_freq // 1, 1),
+        save_path   = cfg.checkpoint_dir,
+        name_prefix = f"noita_ppo_{run_name}",
         verbose     = 1,
     )
 
-    print("[Train] Building PPO model...")
-    model = PPO(
-        "MlpPolicy",
-        env,
-        verbose          = 1,
-        learning_rate    = 3e-4,
-        n_steps          = 2048,
-        batch_size       = 64,
-        n_epochs         = 10,
-        gamma            = 0.99,
-        gae_lambda       = 0.95,
-        clip_range       = 0.2,
-        tensorboard_log  = "./noita_ppo_tensorboard/",
-    )
+    callbacks = CallbackList([monitor_cb, checkpoint_cb])
 
-    print("[Train] Starting training — 1 000 000 steps (~15 h at 18 it/s)")
-    print("[Train] View live curves:  tensorboard --logdir ./noita_ppo_tensorboard/")
+    # ── Train ─────────────────────────────────────────────────────────────────
+    console.rule(f"[bold green]NoitaRL — {run_name}")
+    console.print(f"  Steps:   [cyan]{cfg.total_timesteps:,}[/]")
+    console.print(f"  Port:    [cyan]{cfg.noita_base_port}[/]")
+    console.print(f"  W&B:     [cyan]{cfg.wandb_enabled}[/]")
+    console.print(f"  TG:      [cyan]{cfg.telegram_enabled}[/]")
+    console.print(f"  TBoard:  tensorboard --logdir {cfg.tensorboard_dir}")
+    console.rule()
+
     try:
         model.learn(
-            total_timesteps = 1_000_000,
-            callback        = checkpoint_cb,
-            progress_bar    = True,
+            total_timesteps     = cfg.total_timesteps,
+            callback            = callbacks,
+            progress_bar        = True,
+            reset_num_timesteps = cfg.resume_from is None,
+            tb_log_name         = run_name,
         )
-        print("[Train] Training complete!")
+        logger.success("Training complete!")
     except KeyboardInterrupt:
-        print("[Train] Interrupted by user.")
+        logger.warning("Interrupted by user.")
+    except Exception as exc:
+        logger.exception("Training crashed: {}", exc)
+        notifier.send_text(f"💥 <b>Training crashed!</b>\n{exc}")
+        raise
+    finally:
+        out = os.path.join(cfg.checkpoint_dir, f"{run_name}_final")
+        model.save(out)
+        logger.info("Model saved → {}.zip", out)
+        notifier.stop()
 
-    model.save("noita_ppo_final")
-    print("[Train] Model saved → noita_ppo_final.zip")
-    print("[Train] Resume later with:  PPO.load('noita_ppo_final').learn(...)")
+        if cfg.wandb_enabled:
+            try:
+                import wandb
+                wandb.finish()
+            except Exception:
+                pass
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="NoitaRL — single-env PPO training")
+    p.add_argument("--resume", type=str, default=None, metavar="PATH",
+                   help="Resume from a .zip checkpoint")
+    p.add_argument("--name",   type=str, default=None, metavar="NAME",
+                   help="Human-readable run name (also used in W&B / log file)")
+    return p.parse_args()
 
 
 if __name__ == "__main__":
-    train()
+    train(parse_args())

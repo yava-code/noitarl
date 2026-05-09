@@ -18,11 +18,16 @@ Single-machine quick test (2 instances):
 """
 
 import os
+import sys
 import argparse
+from loguru import logger
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import SubprocVecEnv
-from stable_baselines3.common.callbacks import CheckpointCallback
+from stable_baselines3.common.callbacks import CallbackList, CheckpointCallback
+from callbacks import NoitaMonitorCallback
+from config import Config
 from noita_env import NoitaEnv
+from notify import TelegramNotifier
 
 
 def make_env(port: int):
@@ -33,56 +38,71 @@ def make_env(port: int):
 
 
 def train(n_envs: int, base_port: int, total_steps: int, resume: str | None):
-    os.makedirs("checkpoints", exist_ok=True)
+    cfg = Config()
+    cfg.n_envs          = n_envs
+    cfg.noita_base_port = base_port
+    cfg.total_timesteps = total_steps
+    if resume:
+        cfg.resume_from = resume
+
+    os.makedirs(cfg.checkpoint_dir, exist_ok=True)
+    run_name = cfg.effective_run_name()
+
+    logger.remove()
+    logger.add(sys.stderr, level="INFO",
+               format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <level>{message}</level>")
+    os.makedirs(cfg.log_dir, exist_ok=True)
+    logger.add(f"{cfg.log_dir}/{run_name}.log", rotation="100 MB")
+
+    notifier = TelegramNotifier(cfg.telegram_token, cfg.telegram_chat_id)
+    notifier.start_polling()
 
     ports = [base_port + i for i in range(n_envs)]
-    print(f"[MultiTrain] Starting {n_envs} envs on ports {ports}")
+    logger.info("Starting {} envs on ports {}", n_envs, ports)
 
     env = SubprocVecEnv([make_env(p) for p in ports])
 
+    monitor_cb    = NoitaMonitorCallback(cfg, notifier)
     checkpoint_cb = CheckpointCallback(
-        save_freq   = 100_000 // n_envs,   # wall-clock steps per env
-        save_path   = "./checkpoints/",
+        save_freq   = max(cfg.checkpoint_freq // n_envs, 1),
+        save_path   = cfg.checkpoint_dir,
         name_prefix = f"noita_ppo_{n_envs}env",
         verbose     = 1,
     )
+    callbacks = CallbackList([monitor_cb, checkpoint_cb])
 
     if resume:
-        print(f"[MultiTrain] Resuming from {resume}")
-        model = PPO.load(resume, env=env)
+        logger.info("Resuming from {}", resume)
+        model = PPO.load(resume, env=env, tensorboard_log=cfg.tensorboard_dir)
     else:
         model = PPO(
-            "MlpPolicy",
-            env,
-            verbose         = 1,
-            learning_rate   = 3e-4,
-            n_steps         = 2048,
-            batch_size      = 64,
-            n_epochs        = 10,
-            gamma           = 0.99,
-            gae_lambda      = 0.95,
-            clip_range      = 0.2,
-            tensorboard_log = "./noita_ppo_tensorboard/",
+            "MlpPolicy", env,
+            verbose=1, learning_rate=cfg.learning_rate, n_steps=cfg.n_steps,
+            batch_size=cfg.batch_size, n_epochs=cfg.n_epochs, gamma=cfg.gamma,
+            gae_lambda=cfg.gae_lambda, clip_range=cfg.clip_range,
+            tensorboard_log=cfg.tensorboard_dir,
         )
 
-    print(f"[MultiTrain] Training for {total_steps:,} steps "
-          f"(≈ {total_steps / n_envs / 18 / 3600:.1f} h per env at 18 it/s)")
-    print("[MultiTrain] TensorBoard:  tensorboard --logdir ./noita_ppo_tensorboard/")
+    logger.info("Training {}×{:,} steps, ~{:.1f}h per env",
+                n_envs, total_steps, total_steps / n_envs / 18 / 3600)
+    logger.info("TensorBoard: tensorboard --logdir {}", cfg.tensorboard_dir)
 
     try:
-        model.learn(
-            total_timesteps = total_steps,
-            callback        = checkpoint_cb,
-            progress_bar    = True,
-            reset_num_timesteps = resume is None,
-        )
-        print("[MultiTrain] Done!")
+        model.learn(total_timesteps=total_steps, callback=callbacks,
+                    progress_bar=True, reset_num_timesteps=resume is None,
+                    tb_log_name=run_name)
+        logger.success("Training complete!")
     except KeyboardInterrupt:
-        print("[MultiTrain] Interrupted.")
-
-    out = f"noita_ppo_{n_envs}env_final"
-    model.save(out)
-    print(f"[MultiTrain] Saved → {out}.zip")
+        logger.warning("Interrupted.")
+    except Exception as exc:
+        logger.exception("Crashed: {}", exc)
+        notifier.send_text(f"💥 Multi-train crashed: {exc}")
+        raise
+    finally:
+        out = os.path.join(cfg.checkpoint_dir, f"{run_name}_final")
+        model.save(out)
+        logger.info("Saved → {}.zip", out)
+        notifier.stop()
 
 
 if __name__ == "__main__":

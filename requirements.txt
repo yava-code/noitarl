@@ -1,8 +1,28 @@
-gymnasium
-numpy
-websockets
-stable-baselines3
-shimmy
-tensorboard
-tqdm
-rich
+# Core RL
+stable-baselines3[extra]>=2.3.0
+gymnasium>=0.29.0
+numpy>=1.26.0
+torch>=2.2.0
+shimmy>=2.0.0
+tensorboard>=2.16.0
+
+# Experiment tracking
+wandb>=0.17.0
+
+# Config management
+pydantic-settings>=2.3.0
+python-dotenv>=1.0.0
+
+# Logging & terminal UI
+loguru>=0.7.0
+rich>=13.7.0
+
+# Notifications (pure requests — no extra bot lib)
+requests>=2.31.0
+urllib3>=2.2.0
+
+# Plots for Telegram reports
+matplotlib>=3.8.0
+
+# WebSocket server
+websockets>=12.0
