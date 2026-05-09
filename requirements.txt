@@ -1,0 +1,8 @@
+gymnasium
+numpy
+websockets
+stable-baselines3
+shimmy
+tensorboard
+tqdm
+rich

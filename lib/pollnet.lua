@@ -2,7 +2,7 @@
 
 -- Change this as necessary to point to where [lib?]pollnet.dll|.so|.dylib
 -- is actually located.
-local LIBDIR = "mods/rl_agent/bin/"
+local LIBDIR = "mods/noitarl/bin/"
 local API_VERSION = "1.0.0"
 
 local ffi = require("ffi")

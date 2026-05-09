@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+venv_rl/
+.env
+
+# Noita & ML Logs
+logger.txt
+noita_ppo_tensorboard/
+*.log
+
+# Models & Data
+*.zip
+*.pth
+*.h5
+
+# IDEs
+.idea/
+.vscode/
+.DS_Store
