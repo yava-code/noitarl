@@ -342,3 +342,6 @@
 [2026-05-09 14:12:19] [NOITARL] DIAG f=16440 player=164 pos=(685.6,-88.0) vel=(0.00,60.00) on_ground=false action=0 cdata=true
 [2026-05-09 14:12:20] [NOITARL] DIAG f=16500 player=164 pos=(685.6,-88.0) vel=(0.00,65.83) on_ground=false action=0 cdata=true
 [2026-05-09 14:12:23] [NOITARL] Socket error, will reconnect
+[14:31:01] [NOITARL] Mod init started
+[14:31:17] [NOITARL] Connecting to ws://localhost:5001
+[14:31:17] [NOITARL] Spawn recorded (227, -79)

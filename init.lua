@@ -1,166 +1,212 @@
 -- mods/noitarl/init.lua
 
 local function log(msg)
-    local timestamp = os.date("%Y-%m-%d %H:%M:%S")
-    local formatted_msg = string.format("[%s] [NOITARL] %s", timestamp, tostring(msg))
-    print(formatted_msg)
+    local ts  = os.date("%H:%M:%S")
+    local out = string.format("[%s] [NOITARL] %s", ts, tostring(msg))
+    print(out)
     local f = io.open("mods/noitarl/logger.txt", "a")
-    if f then
-        f:write(formatted_msg .. "\n")
-        f:close()
-    end
+    if f then f:write(out .. "\n"); f:close() end
 end
 
 log("Mod init started")
 
-local function get_mod_path()
-    return "mods/noitarl/"
-end
+local json    = dofile("mods/noitarl/lib/json.lua")
+local pollnet = dofile("mods/noitarl/lib/pollnet.lua")
 
-local json    = dofile(get_mod_path() .. "lib/json.lua")
-local pollnet = dofile(get_mod_path() .. "lib/pollnet.lua")
+-- ── Connection ────────────────────────────────────────────────────────────
+local socket                    = nil
+local last_connection_attempt   = 0
+local connection_retry_interval = 180   -- frames (~3 sec at 60fps)
+local gui                       = nil
 
-local socket                   = nil
-local last_connection_attempt  = 0
-local connection_retry_interval = 180
-local gui                      = nil
-local pending_action           = 0  -- last action from Python, applied in pre-update
+-- ── Movement ──────────────────────────────────────────────────────────────
+local MOVE_SPEED      = 60
+local JUMP_SPEED      = -150
+local pending_action  = 0
+local last_action     = 0
+local ACTION_NAMES    = {[0]="IDLE",[1]="LEFT",[2]="RIGHT",[3]="JUMP",[4]="FIRE"}
 
-local MOVE_SPEED          = 50    -- horizontal velocity (Noita units)
-local JUMP_SPEED          = -150  -- negative = up
-local DIAG_LOG_EVERY      = 60    -- frames between diag dumps
-local last_applied_action = 0
+-- ── Episode state ─────────────────────────────────────────────────────────
+local spawn_x, spawn_y  = nil, nil
+local episode_num       = 0
+local episode_steps     = 0
+local DEATH_HP          = 0.02   -- respawn when hp fraction falls below this
 
+-- ── Apply action via direct velocity write ────────────────────────────────
+-- Writing to CharacterDataComponent.mVelocity bypasses the input pipeline;
+-- ControlsComponent button fields are overwritten by the engine's keyboard
+-- reader each frame and don't survive to the physics tick.
 local function apply_action(player, action)
     if not player or player == 0 then return end
-    last_applied_action = action
+    last_action = action
 
-    -- Direct velocity write — bypasses input pipeline that overrides ControlsComponent every frame
     local cdata = EntityGetFirstComponent(player, "CharacterDataComponent")
     if cdata then
         local vx, vy    = ComponentGetValue2(cdata, "mVelocity")
         local on_ground = ComponentGetValue2(cdata, "is_on_ground")
-
-        if action == 1 then            -- LEFT
-            vx = -MOVE_SPEED
-        elseif action == 2 then        -- RIGHT
-            vx =  MOVE_SPEED
-        elseif action == 3 and on_ground then  -- JUMP only when grounded
-            vy = JUMP_SPEED
+        if     action == 1 then vx = -MOVE_SPEED
+        elseif action == 2 then vx =  MOVE_SPEED
+        elseif action == 3 and on_ground then vy = JUMP_SPEED
         end
         ComponentSetValue2(cdata, "mVelocity", vx, vy)
     end
 
-    -- Fire still goes through ControlsComponent (not velocity-based)
+    -- Fire goes through ControlsComponent (not velocity-based)
     local ctrl = EntityGetFirstComponent(player, "ControlsComponent")
     if ctrl then
         local fire = (action == 4)
         ComponentSetValue2(ctrl, "mButtonDownFire", fire)
-        if fire then
-            ComponentSetValue2(ctrl, "mButtonFrameFire", GameGetFrameNum())
-        end
+        if fire then ComponentSetValue2(ctrl, "mButtonFrameFire", GameGetFrameNum()) end
     end
 end
 
--- Apply buffered action BEFORE the simulation runs this frame
+-- ── Respawn: restore HP and teleport to spawn position ───────────────────
+local function respawn_player(player)
+    local dmg = EntityGetFirstComponent(player, "DamageModelComponent")
+    if dmg then
+        ComponentSetValue2(dmg, "hp", ComponentGetValue2(dmg, "max_hp"))
+    end
+    if spawn_x then
+        EntitySetTransform(player, spawn_x, spawn_y)
+    end
+    local cdata = EntityGetFirstComponent(player, "CharacterDataComponent")
+    if cdata then ComponentSetValue2(cdata, "mVelocity", 0, 0) end
+
+    episode_num    = episode_num + 1
+    episode_steps  = 0
+    pending_action = 0
+    log(string.format("Ep %d started — spawn (%.0f, %.0f)", episode_num, spawn_x or 0, spawn_y or 0))
+end
+
+-- ── Ray visualisation (dev build only) ───────────────────────────────────
+-- Each ray: green endpoint = open space, red = wall nearby.
+-- Two dots per ray (50% and 100%) create a dotted-line effect.
+local function draw_rays(ox, oy, rays)
+    if not DEBUG_MARK then return end
+    for i = 0, 15 do
+        local angle = i * (math.pi / 8)
+        local dist  = rays[i + 1]
+        local len   = dist * 150
+        local r, g  = 1.0 - dist, dist
+        DEBUG_MARK(ox + math.cos(angle)*len*0.5, oy + math.sin(angle)*len*0.5, "", r*0.5, g*0.5, 0)
+        DEBUG_MARK(ox + math.cos(angle)*len,     oy + math.sin(angle)*len,     "", r,     g,     0)
+    end
+end
+
+-- ── Pre-update: apply buffered action BEFORE physics simulation ───────────
 function OnWorldPreUpdate()
     if not RaytracePlatforms then return end
     local player = EntityGetWithTag("player_unit")[1]
-    if player then
-        apply_action(player, pending_action)
-
-        local frame = GameGetFrameNum()
-        if (frame % DIAG_LOG_EVERY) == 0 then
-            local px, py = EntityGetTransform(player)
-            local cdata  = EntityGetFirstComponent(player, "CharacterDataComponent")
-            local vx, vy, grounded = 0, 0, false
-            if cdata then
-                vx, vy   = ComponentGetValue2(cdata, "mVelocity")
-                grounded = ComponentGetValue2(cdata, "is_on_ground")
-            end
-            log(string.format(
-                "DIAG f=%d player=%d pos=(%.1f,%.1f) vel=(%.2f,%.2f) on_ground=%s action=%d cdata=%s",
-                frame, player, px, py, vx, vy, tostring(grounded),
-                last_applied_action, tostring(cdata ~= nil)
-            ))
-        end
-    end
+    if player then apply_action(player, pending_action) end
 end
 
--- After simulation: send state to Python, receive next action into buffer
+-- ── Post-update: gather state, draw HUD, communicate with Python ──────────
 function OnWorldPostUpdate()
     if not RaytracePlatforms then return end
 
     local frame  = GameGetFrameNum()
     local player = EntityGetWithTag("player_unit")[1]
 
+    -- HUD ──────────────────────────────────────────────────────────────────
     if not gui then gui = GuiCreate() end
-    local status_text = "RL AGENT: "
-    if not socket then
-        local retry_in = math.max(0, connection_retry_interval - (frame - last_connection_attempt))
-        status_text = status_text .. "DISCONNECTED (retry in " .. retry_in .. ")"
-    else
-        status_text = status_text .. "STATE: " .. tostring(socket:status())
-                   .. " | ACT: " .. tostring(pending_action)
-    end
     GuiStartFrame(gui)
-    GuiIdPushString(gui, "rl_debug")
-    GuiText(gui, 10, 10, status_text)
+    GuiIdPushString(gui, "rl_hud")
+    if not socket then
+        local retry = math.max(0, connection_retry_interval - (frame - last_connection_attempt))
+        GuiText(gui, 10, 10, string.format("RL AGENT: DISCONNECTED  retry in %d", retry))
+    else
+        GuiText(gui, 10, 10, string.format(
+            "RL AGENT  Ep:%-3d  Step:%-5d  Act: %s",
+            episode_num, episode_steps, ACTION_NAMES[pending_action] or "?"))
+        GuiText(gui, 10, 20, string.format(
+            "socket: %s   spawn: (%.0f, %.0f)",
+            socket:status(), spawn_x or 0, spawn_y or 0))
+    end
     GuiIdPop(gui)
 
+    -- Connection management ────────────────────────────────────────────────
     if not socket then
         if frame - last_connection_attempt > connection_retry_interval then
-            log("Attempting connect to ws://localhost:5001")
+            log("Connecting to ws://localhost:5001")
             last_connection_attempt = frame
             socket = pollnet.open_ws("ws://localhost:5001")
         end
         return
     end
 
-    local happy, msg = socket:poll()
-    local state = socket:status()
+    local _, msg  = socket:poll()
+    local st      = socket:status()
 
-    if state == "open" then
-        if player then
-            local x, y = EntityGetTransform(player)
-            local hp   = 1.0
-            local dmg  = EntityGetFirstComponent(player, "DamageModelComponent")
-            if dmg then
-                hp = ComponentGetValue2(dmg, "hp") / ComponentGetValue2(dmg, "max_hp")
-            end
-
-            local vx, vy = 0, 0
-            local cdata  = EntityGetFirstComponent(player, "CharacterDataComponent")
-            if cdata then
-                vx, vy = ComponentGetValue2(cdata, "mVelocity")
-            end
-
-            local rays = {}
-            for i = 0, 15 do
-                local angle = i * (math.pi / 8)
-                local hit, hx, hy = RaytracePlatforms(
-                    x, y,
-                    x + math.cos(angle) * 150,
-                    y + math.sin(angle) * 150
-                )
-                local dist = hit and (math.sqrt((hx - x)^2 + (hy - y)^2) / 150) or 1.0
-                table.insert(rays, dist)
-            end
-
-            socket:send(json.encode({ x = x, y = y, hp = hp, vx = vx, vy = vy, rays = rays }))
-        end
-    elseif state == "error" or state == "closed" then
-        log("Socket " .. state .. ", will reconnect")
+    if st == "error" or st == "closed" then
+        log("Socket " .. st .. " — will reconnect")
         pending_action = 0
         socket = nil
         return
     end
 
-    -- Buffer the received action for next frame's pre-update
+    -- Buffer incoming action for next frame's pre-update ──────────────────
     if msg and type(msg) == "string" then
-        local ok, action = pcall(json.decode, msg)
-        if ok and type(action) == "number" then
-            pending_action = action
+        local ok, act = pcall(json.decode, msg)
+        if ok and type(act) == "number" then pending_action = act end
+    end
+
+    if st ~= "open" or not player then return end
+
+    -- Gather player state ──────────────────────────────────────────────────
+    local x, y = EntityGetTransform(player)
+
+    if not spawn_x then                  -- record once on first live frame
+        spawn_x, spawn_y = x, y
+        episode_num = 1
+        log(string.format("Spawn recorded (%.0f, %.0f)", x, y))
+    end
+
+    local hp = 1.0
+    local dmg = EntityGetFirstComponent(player, "DamageModelComponent")
+    if dmg then
+        local raw_max = ComponentGetValue2(dmg, "max_hp")
+        if raw_max and raw_max > 0 then
+            hp = ComponentGetValue2(dmg, "hp") / raw_max
         end
     end
+
+    local vx, vy, on_ground = 0.0, 0.0, false
+    local cdata = EntityGetFirstComponent(player, "CharacterDataComponent")
+    if cdata then
+        vx, vy   = ComponentGetValue2(cdata, "mVelocity")
+        on_ground = ComponentGetValue2(cdata, "is_on_ground")
+    end
+
+    -- 16 raytrace sensors ──────────────────────────────────────────────────
+    local rays = {}
+    for i = 0, 15 do
+        local angle = i * (math.pi / 8)
+        local hit, hx, hy = RaytracePlatforms(
+            x, y,
+            x + math.cos(angle) * 150,
+            y + math.sin(angle) * 150
+        )
+        rays[i + 1] = hit and math.sqrt((hx-x)^2 + (hy-y)^2) / 150 or 1.0
+    end
+
+    draw_rays(x, y, rays)
+    episode_steps = episode_steps + 1
+
+    -- Death detection ──────────────────────────────────────────────────────
+    if hp <= DEATH_HP then
+        log(string.format("Ep %d ended  steps=%d  pos=(%.0f,%.0f)",
+            episode_num, episode_steps, x, y))
+        socket:send(json.encode({
+            x=x, y=y, hp=0.0, vx=0.0, vy=0.0,
+            rays=rays, dead=true, on_ground=false
+        }))
+        respawn_player(player)
+        return
+    end
+
+    -- Send live state ──────────────────────────────────────────────────────
+    socket:send(json.encode({
+        x=x, y=y, hp=hp, vx=vx, vy=vy,
+        rays=rays, dead=false, on_ground=on_ground
+    }))
 end
