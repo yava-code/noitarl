@@ -51,6 +51,7 @@ class NoitaEnv(gym.Env):
         self.episode_steps  = 0
         self.episode_reward = 0.0
         self.last_hp        = 1.0
+        self.last_x         = 0.0
         self.max_depth_y    = 0.0
 
         self._start_server()
@@ -158,44 +159,61 @@ class NoitaEnv(gym.Env):
         if s:
             self.last_hp     = s.get("hp", 1.0)
             self.max_depth_y = s.get("y", 0.0)
+            self.last_x      = s.get("x", 0.0)
 
         return self._obs_from_state(s), {}
 
-    def step(self, action: int):
-        self._send_action(int(action))
-        time.sleep(0.05)      # ~3 Noita frames at 60 fps
+    def _wait_for_new_frame(self, prev_frame: int, timeout: float = 2.0) -> Optional[dict]:
+        """Block until Noita sends a state with a different frame number."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            s = self._get_state()
+            if s is not None and s.get("frame", -1) != prev_frame:
+                return s
+            time.sleep(0.008)   # poll every 8 ms (~2x per Noita frame at 60fps)
+        # timeout — return whatever we have (Noita may be loading/paused)
+        return self._get_state()
 
-        state = self._get_state()
+    def step(self, action: int):
+        prev_state = self._get_state()
+        prev_frame = prev_state.get("frame", -1) if prev_state else -1
+
+        self._send_action(int(action))
+
+        # Wait for a genuinely new game frame, not stale data
+        state = self._wait_for_new_frame(prev_frame)
 
         if state is None:
-            # Noita disconnected — return zeros, keep episode going
             logger.debug("[env:{}] step() with no state (disconnected?)", self.port)
             return self._obs_from_state(None), 0.0, False, False, {}
 
+        current_x  = state.get("x",  0.0)
         current_y  = state.get("y",  0.0)
         current_hp = state.get("hp", 0.0)
         dead       = state.get("dead", False)
 
         # ── Reward ────────────────────────────────────────────────────────────
-        reward = 0.0
+        reward = 0.01   # survival
 
-        # Survival bonus
-        reward += 0.01
+        # Horizontal exploration: reward any x movement (encourages not standing still)
+        dx = abs(current_x - self.last_x)
+        reward += min(dx, 30.0) * 0.005    # capped so one big jump isn't outsized
 
-        # New depth record (Noita +Y = deeper underground)
+        # Depth progress (Noita +Y = deeper underground)
         if current_y > self.max_depth_y:
             reward += (current_y - self.max_depth_y) * 0.3
             self.max_depth_y = current_y
 
-        # Damage penalty (proportional)
+        # Damage penalty — reduced so agent isn't too scared to explore
         if current_hp < self.last_hp:
-            reward -= (self.last_hp - current_hp) * 10.0
+            reward -= (self.last_hp - current_hp) * 3.0
 
         # Death penalty
         if dead:
-            reward -= 2.0
+            reward -= 1.0
 
         self.last_hp         = current_hp
+        self.last_x          = current_x
         self.episode_steps  += 1
         self.episode_reward += reward
 
@@ -205,7 +223,6 @@ class NoitaEnv(gym.Env):
                 self.port, self.episode_num, self.episode_steps,
                 self.episode_reward, self.max_depth_y,
             )
-            # SB3 needs episode info in the info dict for its internal buffers
             info = {"episode": {"r": self.episode_reward, "l": self.episode_steps}}
             with self._lock:
                 self._state = None   # force reset() to wait for fresh state

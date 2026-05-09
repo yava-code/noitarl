@@ -3,7 +3,21 @@
 -- Communicates with noita_env.py via WebSocket (pollnet.dll).
 
 -- ── Logging ───────────────────────────────────────────────────────────────
-local LOG_FILE = "mods/noitarl/logger.txt"
+local function script_dir()
+    local source = debug.getinfo(1, "S").source or ""
+    if source:sub(1, 1) == "@" then
+        source = source:sub(2)
+    end
+    source = source:gsub("\\", "/")
+    return source:match("^(.*)/[^/]+$") or "."
+end
+
+local MOD_ROOT = script_dir()
+local function mod_path(rel)
+    return MOD_ROOT .. "/" .. rel
+end
+
+local LOG_FILE = mod_path("logger.txt")
 
 local function log(level, msg)
     local line = string.format("[%s] [%s] %s", os.date("%H:%M:%S"), level, tostring(msg))
@@ -37,15 +51,15 @@ local function cset(comp, field, ...)
 end
 
 -- ── Libraries ─────────────────────────────────────────────────────────────
-local json_ok, json = pcall(dofile, "mods/noitarl/lib/json.lua")
+local json_ok, json = pcall(dofile, mod_path("lib/json.lua"))
 if not json_ok then err("json.lua failed: " .. tostring(json)); return end
 
-local pn_ok, pollnet = pcall(dofile, "mods/noitarl/lib/pollnet.lua")
+local pn_ok, pollnet = pcall(dofile, mod_path("lib/pollnet.lua"))
 if not pn_ok then err("pollnet.lua failed: " .. tostring(pollnet)); return end
 
 -- ── Config ────────────────────────────────────────────────────────────────
 local function read_port()
-    local f = io.open("mods/noitarl/port.txt", "r")
+    local f = io.open(mod_path("port.txt"), "r")
     if f then local p = tonumber(f:read("*l")); f:close(); if p then return p end end
     return 5001
 end
@@ -182,6 +196,13 @@ local function build_rays(x, y)
     return rays
 end
 
+-- ── Prevent auto-pause on focus loss during RL training ──────────────────
+function OnPausedChanged(is_paused, is_inventory_pause)
+    if is_paused and not is_inventory_pause then
+        GameSetPaused(false)
+    end
+end
+
 -- ── Pre-update: apply buffered action BEFORE physics ─────────────────────
 function OnWorldPreUpdate()
     if not RaytracePlatforms then return end
@@ -230,27 +251,18 @@ function OnWorldPostUpdate()
             info("Connecting → " .. WS_URL)
             last_connection_attempt = frame
             consecutive_errors = 0
-            local ok, s = pcall(pollnet.open_ws, pollnet, WS_URL)
+            local ok, s = pcall(pollnet.open_ws, WS_URL)
             if ok then socket = s else err("open_ws failed: " .. tostring(s)) end
         end
         return
     end
 
     -- Poll socket ──────────────────────────────────────────────────────────
-    local poll_ok, poll_err_or_msg = pcall(function()
-        return socket:poll()
-    end)
+    local poll_ok, happy, msg = pcall(socket.poll, socket)
     if not poll_ok then
-        err("socket:poll() threw: " .. tostring(poll_err_or_msg))
+        err("socket:poll() threw: " .. tostring(happy))
         socket = nil; return
     end
-    local _, msg = poll_ok, poll_err_or_msg  -- poll returns (happy, message)
-    -- actually pcall returns (true, v1, v2) — re-do:
-    local poll_ok2, happy, msg2 = pcall(socket.poll, socket)
-    if not poll_ok2 then
-        err("socket poll error"); socket = nil; return
-    end
-    msg = msg2  -- might be nil or string
 
     local st = socket:status()
 
@@ -316,7 +328,6 @@ function OnWorldPostUpdate()
     local rays = build_rays(x, y)
 
     -- Draw radar ───────────────────────────────────────────────────────────
-    GuiStartFrame(gui)
     GuiIdPushString(gui, "rl_radar")
     draw_radar(gui, 10, 24, rays)
     GuiIdPop(gui)
@@ -348,7 +359,7 @@ function OnWorldPostUpdate()
     end
 
     -- Send live state ──────────────────────────────────────────────────────
-    local state = {x=x, y=y, hp=hp, vx=vx, vy=vy, rays=rays, dead=false, on_ground=on_ground}
+    local state = {x=x, y=y, hp=hp, vx=vx, vy=vy, rays=rays, dead=false, on_ground=on_ground, frame=frame}
     local ok5, encoded = pcall(json.encode, state)
     if ok5 then
         local ok6, send_err = pcall(socket.send, socket, encoded)

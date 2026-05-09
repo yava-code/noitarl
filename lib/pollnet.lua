@@ -2,8 +2,18 @@
 
 -- Change this as necessary to point to where [lib?]pollnet.dll|.so|.dylib
 -- is actually located.
-local LIBDIR = "mods/noitarl/bin/"
 local API_VERSION = "1.0.0"
+
+local function script_dir()
+  local source = debug.getinfo(1, "S").source or ""
+  if source:sub(1, 1) == "@" then
+    source = source:sub(2)
+  end
+  source = source:gsub("\\", "/")
+  return source:match("^(.*)/[^/]+$") or "."
+end
+
+local LIBDIR = script_dir():gsub("/lib$", "") .. "/bin/"
 
 local ffi = require("ffi")
 ffi.cdef[[
