@@ -1,0 +1,51 @@
+[2026-05-09 02:04:22] [RL_AGENT] Starting RL Agent mod initialization...
+[2026-05-09 02:04:22] [RL_AGENT] json.lua loaded
+[2026-05-09 02:04:22] [RL_AGENT] Attempting to load pollnet.dll from mods/rl_agent/bin/pollnet.dll
+[2026-05-09 02:04:22] [RL_AGENT] CRITICAL ERROR: Failed to get pollnet_loader. Error: Не найдена указанная процедура.
+
+[2026-05-09 02:10:00] [RL_AGENT] Starting RL Agent mod initialization (FFI mode)...
+[2026-05-09 02:10:00] [RL_AGENT] json.lua loaded
+[2026-05-09 02:10:00] [RL_AGENT] pollnet.lua (FFI) successfully loaded
+[2026-05-09 02:10:08] [RL_AGENT] Attempting to connect to Python server at ws://localhost:5000
+[2026-05-09 02:10:08] [RL_AGENT] WebSocket state: opening
+[2026-05-09 02:10:08] [RL_AGENT] WebSocket state: error
+[2026-05-09 02:10:08] [RL_AGENT] Socket error or closed. Resetting socket.
+[2026-05-09 02:10:08] [RL_AGENT] Failed to decode action message: HTTP error: 403 Forbidden
+[2026-05-09 02:10:11] [RL_AGENT] Attempting to connect to Python server at ws://localhost:5000
+[2026-05-09 02:10:11] [RL_AGENT] Socket error or closed. Resetting socket.
+[2026-05-09 02:10:11] [RL_AGENT] Failed to decode action message: HTTP error: 403 Forbidden
+[2026-05-09 02:10:14] [RL_AGENT] Attempting to connect to Python server at ws://localhost:5000
+[2026-05-09 02:10:14] [RL_AGENT] Socket error or closed. Resetting socket.
+[2026-05-09 02:10:14] [RL_AGENT] Failed to decode action message: HTTP error: 403 Forbidden
+[2026-05-09 02:10:17] [RL_AGENT] Attempting to connect to Python server at ws://localhost:5000
+[2026-05-09 02:10:17] [RL_AGENT] Socket error or closed. Resetting socket.
+[2026-05-09 02:10:17] [RL_AGENT] Failed to decode action message: HTTP error: 403 Forbidden
+[2026-05-09 02:13:08] [RL_AGENT] Starting RL Agent mod initialization (FFI mode)...
+[2026-05-09 02:13:08] [RL_AGENT] json.lua loaded
+[2026-05-09 02:13:08] [RL_AGENT] pollnet.lua (FFI) successfully loaded
+[2026-05-09 02:13:15] [RL_AGENT] Attempting to connect to Python server at ws://localhost:5001
+[2026-05-09 02:13:15] [RL_AGENT] WebSocket state: opening
+[2026-05-09 02:13:15] [RL_AGENT] WebSocket state: open
+[2026-05-09 02:13:16] [RL_AGENT] WebSocket state: closed
+[2026-05-09 02:13:16] [RL_AGENT] Socket error or closed. Resetting socket.
+[2026-05-09 02:13:16] [RL_AGENT] Failed to decode action message: closed
+[2026-05-09 02:13:21] [RL_AGENT] Attempting to connect to Python server at ws://localhost:5001
+[2026-05-09 02:13:21] [RL_AGENT] WebSocket state: open
+[2026-05-09 02:13:21] [RL_AGENT] WebSocket state: closed
+[2026-05-09 02:13:21] [RL_AGENT] Socket error or closed. Resetting socket.
+[2026-05-09 02:13:21] [RL_AGENT] Failed to decode action message: closed
+[2026-05-09 02:13:25] [RL_AGENT] Attempting to connect to Python server at ws://localhost:5001
+[2026-05-09 02:13:25] [RL_AGENT] WebSocket state: open
+[2026-05-09 02:13:25] [RL_AGENT] WebSocket state: closed
+[2026-05-09 02:13:25] [RL_AGENT] Socket error or closed. Resetting socket.
+[2026-05-09 02:13:25] [RL_AGENT] Failed to decode action message: closed
+[2026-05-09 02:13:47] [RL_AGENT] Attempting to connect to Python server at ws://localhost:5001
+[2026-05-09 02:13:47] [RL_AGENT] WebSocket state: opening
+[2026-05-09 02:14:18] [RL_AGENT] Starting RL Agent mod initialization (FFI mode)...
+[2026-05-09 02:14:18] [RL_AGENT] json.lua loaded
+[2026-05-09 02:14:18] [RL_AGENT] pollnet.lua (FFI) successfully loaded
+[2026-05-09 02:18:39] [RL_AGENT] Starting RL Agent mod initialization (FFI mode)...
+[2026-05-09 02:18:39] [RL_AGENT] json.lua loaded
+[2026-05-09 02:18:39] [RL_AGENT] pollnet.lua (FFI) successfully loaded
+[2026-05-09 02:20:10] [RL_AGENT] Mod init started
+[2026-05-09 02:21:48] [RL_AGENT] Mod init started
