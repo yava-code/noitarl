@@ -1,0 +1,2 @@
+2026, 5, 11 - 1:30
+Assert failed: (!( i < 0 || i >= _size )) in d:\projects\nollagames\fallingeverything\poro\source\utils\filesystem\../safearray/csafearray.h at line 75

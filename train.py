@@ -76,10 +76,26 @@ def setup_wandb(cfg: Config, run_name: str) -> None:
         logger.warning("W&B init failed (continuing without it): {}", exc)
 
 
+def find_latest_checkpoint(checkpoint_dir: str) -> str | None:
+    """Return the most recently modified .zip in checkpoint_dir, or None."""
+    import glob
+    zips = glob.glob(os.path.join(checkpoint_dir, "*.zip"))
+    return max(zips, key=os.path.getmtime) if zips else None
+
+
 def train(args: argparse.Namespace) -> None:
     cfg = Config()
     if args.resume:
         cfg.resume_from = args.resume
+    elif not args.fresh:
+        latest = find_latest_checkpoint(cfg.checkpoint_dir)
+        if latest:
+            logger.info("Auto-resuming from latest checkpoint: {}", latest)
+            cfg.resume_from = latest
+        else:
+            logger.info("No checkpoint found — starting fresh")
+    else:
+        logger.info("--fresh flag set — starting new run from scratch")
     if args.name:
         cfg.run_name = args.name
 
@@ -101,8 +117,19 @@ def train(args: argparse.Namespace) -> None:
     # ── Model ─────────────────────────────────────────────────────────────────
     if cfg.resume_from:
         logger.info("Resuming from {}", cfg.resume_from)
-        model = PPO.load(cfg.resume_from, env=env, tensorboard_log=cfg.tensorboard_dir)
-    else:
+        try:
+            model = PPO.load(cfg.resume_from, env=env, tensorboard_log=cfg.tensorboard_dir)
+        except ValueError as exc:
+            if "Observation spaces do not match" in str(exc):
+                logger.warning(
+                    "Checkpoint obs-space mismatch ({}) — obs space likely changed. "
+                    "Starting fresh. Use --resume to force a specific checkpoint.",
+                    exc,
+                )
+                cfg.resume_from = None
+            else:
+                raise
+    if not cfg.resume_from:
         model = PPO(
             "MlpPolicy",
             env,
@@ -170,7 +197,9 @@ def train(args: argparse.Namespace) -> None:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="NoitaRL — single-env PPO training")
     p.add_argument("--resume", type=str, default=None, metavar="PATH",
-                   help="Resume from a .zip checkpoint")
+                   help="Resume from a specific .zip checkpoint")
+    p.add_argument("--fresh",  action="store_true",
+                   help="Ignore existing checkpoints and start a new run from scratch")
     p.add_argument("--name",   type=str, default=None, metavar="NAME",
                    help="Human-readable run name (also used in W&B / log file)")
     return p.parse_args()

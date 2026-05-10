@@ -1,12 +1,21 @@
 """
 Gymnasium environment bridging Python ↔ Noita via WebSocket.
 
-Observation (20 float32, all in [0, 1]):
-  [0..15]  16 RaytracePlatforms sensors (0=wall at player, 1=150px clear)
-  [16]     hp fraction
-  [17]     vx normalised  (−200..+200 → 0..1)
-  [18]     vy normalised
-  [19]     on_ground
+Observation (57 float32, all in [0, 1]):
+  [0..15]   16 platform rays       (0=wall, 1=150 px clear)
+  [16..23]   8 enemy radar sectors  (1=none, 0=enemy at player)
+  [24..31]   8 liquid sensors       (0=dry, ~1=pool ahead)
+  [32..39]   8 projectile radar     (1=clear, 0=bullet at player)
+  [40..47]   8 gold radar sectors   (1=no gold, 0=gold at player)
+  [48]       hp fraction
+  [49]       vx normalised  (−200..+200 → 0..1)
+  [50]       vy normalised
+  [51]       on_ground
+  [52]       jetpack fuel   (0=empty, 1=full)
+  [53]       wand ready     (0=cooldown, 1=can fire)
+  [54]       is_on_fire     (0 or 1)
+  [55]       is_poisoned    (0 or 1)
+  [56]       sky_visibility (1=surface, 0=deep underground)
 
 Actions (Discrete 5):  0=idle  1=left  2=right  3=jump  4=fire
 """
@@ -37,7 +46,7 @@ class NoitaEnv(gym.Env):
 
         self.action_space = gym.spaces.Discrete(5)
         self.observation_space = gym.spaces.Box(
-            low=0.0, high=1.0, shape=(25,), dtype=np.float32
+            low=0.0, high=1.0, shape=(57,), dtype=np.float32
         )
 
         # WebSocket state (written by WS thread, read by main thread)
@@ -53,6 +62,7 @@ class NoitaEnv(gym.Env):
         self.last_hp        = 1.0
         self.last_x         = 0.0
         self.max_depth_y    = 0.0
+        self.last_gold      = 0
 
         self._start_server()
         logger.info("[env:{}] WebSocket server on {}:{}", port, host, port)
@@ -129,23 +139,50 @@ class NoitaEnv(gym.Env):
         return False
 
     def _obs_from_state(self, state: Optional[dict]) -> np.ndarray:
+        # Layout (57 total):
+        #  [0..15]   platform rays      (1=clear, 0=wall)
+        #  [16..23]  enemy radar        (1=none, 0=enemy at player)
+        #  [24..31]  liquid sensors     (0=dry, ~1=pool ahead)
+        #  [32..39]  projectile radar   (1=clear, 0=bullet at player)
+        #  [40..47]  gold radar         (1=no gold, 0=gold at player)
+        #  [48]      hp
+        #  [49]      vx normalised
+        #  [50]      vy normalised
+        #  [51]      on_ground
+        #  [52]      jetpack fuel
+        #  [53]      wand ready
+        #  [54]      is_on_fire
+        #  [55]      is_poisoned
+        #  [56]      sky_visibility
         if state is None:
-            return np.zeros(25, dtype=np.float32)
-        vx  = float(np.clip(state.get("vx", 0.0) / 200.0, -1.0, 1.0)) * 0.5 + 0.5
-        vy  = float(np.clip(state.get("vy", 0.0) / 200.0, -1.0, 1.0)) * 0.5 + 0.5
-        gnd = 1.0 if state.get("on_ground", False) else 0.0
+            return np.zeros(57, dtype=np.float32)
 
-        rays = state.get("rays", [1.0] * 16)
-        if len(rays) != 16:
-            logger.warning("[env:{}] Expected 16 rays, got {}", self.port, len(rays))
-            rays = (rays + [1.0] * 16)[:16]
+        vx   = float(np.clip(state.get("vx", 0.0) / 200.0, -1.0, 1.0)) * 0.5 + 0.5
+        vy   = float(np.clip(state.get("vy", 0.0) / 200.0, -1.0, 1.0)) * 0.5 + 0.5
+        gnd  = 1.0 if state.get("on_ground", False) else 0.0
+        fuel = float(state.get("jetpack_fuel", 1.0))
+        wand = float(state.get("wand_ready",   1.0))
 
-        # 5 liquid sensors (0=dry, ~1=pool ahead); default 0 if not sent (dead state)
-        liquids = state.get("liquid_sensors", [0.0] * 5)
-        if len(liquids) != 5:
-            liquids = (liquids + [0.0] * 5)[:5]
+        def _padn(key, default, n):
+            v = state.get(key, [default] * n)
+            return (v + [default] * n)[:n] if len(v) != n else v
 
-        return np.array(rays + [state.get("hp", 1.0), vx, vy, gnd] + liquids, dtype=np.float32)
+        rays    = _padn("rays",             1.0, 16)
+        enemies = _padn("enemy_radar",      1.0, 8)
+        liquids = _padn("liquid_sensors",   0.0, 8)
+        projs   = _padn("projectile_radar", 1.0, 8)
+        gold    = _padn("gold_radar",       1.0, 8)
+
+        is_on_fire   = float(state.get("is_on_fire",    0.0))
+        is_poisoned  = float(state.get("is_poisoned",   0.0))
+        sky_vis      = float(state.get("sky_visibility", 0.0))
+
+        return np.array(
+            rays + enemies + liquids + projs + gold +
+            [state.get("hp", 1.0), vx, vy, gnd, fuel, wand,
+             is_on_fire, is_poisoned, sky_vis],
+            dtype=np.float32,
+        )
 
     # ── Gymnasium interface ───────────────────────────────────────────────────
 
@@ -156,6 +193,8 @@ class NoitaEnv(gym.Env):
         self.episode_reward  = 0.0
         self.last_hp         = 1.0
         self.max_depth_y     = 0.0
+        self.last_gold       = 0
+        self.visited_chunks: set = set()
 
         logger.debug("[env:{}] reset() — episode {}", self.port, self.episode_num)
 
@@ -200,10 +239,16 @@ class NoitaEnv(gym.Env):
         dead       = state.get("dead", False)
 
         # ── Reward ────────────────────────────────────────────────────────────
-        # Time tax: стоять невыгодно, единственный способ в плюс — идти глубже.
+        # Time tax: стоять невыгодно.
         reward = -0.005
 
-        # Единственный источник плюса — новая глубина.
+        # Curiosity: первое посещение чанка 64×64 пикселя.
+        chunk = (int(current_x // 64), int(current_y // 64))
+        if chunk not in self.visited_chunks:
+            self.visited_chunks.add(chunk)
+            reward += 0.05
+
+        # Новая максимальная глубина.
         if current_y > self.max_depth_y:
             reward += (current_y - self.max_depth_y) * 0.5
             self.max_depth_y = current_y
@@ -211,6 +256,12 @@ class NoitaEnv(gym.Env):
         # Штраф за урон.
         if current_hp < self.last_hp:
             reward -= (self.last_hp - current_hp) * 3.0
+
+        # Награда за сбор золота.
+        current_gold = state.get("gold", 0)
+        if current_gold > self.last_gold:
+            reward += (current_gold - self.last_gold) * 0.001
+        self.last_gold = current_gold
 
         # Штраф за смерть.
         if dead:

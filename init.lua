@@ -78,8 +78,13 @@ local gui                       = nil
 -- ── Movement constants ────────────────────────────────────────────────────
 local MOVE_SPEED     = 60
 local JUMP_SPEED     = -150
-local DEATH_HP       = 0.02
 local FRAME_SKIP     = 4     -- accept new action / send state every N frames
+
+-- Immortal-agent HP hack: engine never kills the player;
+-- we track "virtual HP" ourselves and teleport-respawn when it hits 0.
+local IMMORTAL_HP    = 10000.0
+local VIRTUAL_MAX_HP = 4.0    -- 4.0 engine units ≈ 100% HP in UI
+local virtual_hp     = VIRTUAL_MAX_HP
 
 -- ── Per-frame state ───────────────────────────────────────────────────────
 local pending_action  = 0
@@ -93,9 +98,7 @@ local episode_steps    = 0
 local frame_times      = {}   -- rolling window for FPS estimate
 local PERF_WINDOW      = 60
 
--- ── Apply action: direct velocity write ──────────────────────────────────
--- ControlsComponent.mButtonDown* is overwritten by the engine's keyboard
--- reader before physics; mVelocity is consumed directly by PlayerCollisionSystem.
+-- ── Apply action: smoothed velocity + manual jetpack ─────────────────────
 local function apply_action(player, action)
     if not player or player == 0 then return end
     last_action = action
@@ -104,36 +107,84 @@ local function apply_action(player, action)
     if cdata then
         local vx, vy    = cget(cdata, "mVelocity")
         local on_ground = cget(cdata, "is_on_ground")
+        local fuel      = cget(cdata, "mFlyingTimeLeft") or 1000
         vx = vx or 0; vy = vy or 0
-        if     action == 1 then vx = -MOVE_SPEED
-        elseif action == 2 then vx =  MOVE_SPEED
-        elseif action == 3 and on_ground then vy = JUMP_SPEED
+
+        -- Horizontal: lerp toward target — ground has more grip than air
+        local target_vx = 0
+        if     action == 1 then target_vx = -MOVE_SPEED
+        elseif action == 2 then target_vx =  MOVE_SPEED
         end
+        local grip = on_ground and 0.3 or 0.05
+        vx = vx + (target_vx - vx) * grip
+
+        -- Jump / jetpack
+        if action == 3 then
+            if on_ground then
+                vy = JUMP_SPEED
+            elseif fuel > 0 then
+                vy   = math.max(vy - 12, -200)
+                fuel = math.max(0, fuel - 20)
+            end
+        end
+
+        cset(cdata, "mFlyingTimeLeft", fuel)
         cset(cdata, "mVelocity", vx, vy)
     end
 
-    -- Fire via ControlsComponent (button-based, not velocity)
+    -- Fire + auto-aim on ControlsComponent
     local ctrl = EntityGetFirstComponent(player, "ControlsComponent")
     if ctrl then
+        -- Auto-aim: track nearest enemy every frame so wand is always pointing correctly
+        local tok, px, py = pcall(EntityGetTransform, player)
+        if tok then
+            local aok, enemies = pcall(EntityGetInRadiusWithTag, px, py, 250, "enemy")
+            local nx, ny = px + 50, py   -- default: face right when no enemies
+            if aok and enemies and #enemies > 0 then
+                local nearest_d2 = math.huge
+                for _, eid in ipairs(enemies) do
+                    local eok, ex, ey = pcall(EntityGetTransform, eid)
+                    if eok then
+                        local d2 = (ex-px)^2 + (ey-py)^2
+                        if d2 < nearest_d2 then nearest_d2, nx, ny = d2, ex, ey end
+                    end
+                end
+            end
+            local dx, dy = nx - px, ny - py
+            local len = math.sqrt(dx*dx + dy*dy)
+            if len > 0.001 then
+                cset(ctrl, "mAimingVectorNormalized", dx/len, dy/len)
+                cset(ctrl, "mMousePosition",          nx,     ny)
+            end
+        end
+
         local fire = (action == 4)
         cset(ctrl, "mButtonDownFire", fire)
         if fire then cset(ctrl, "mButtonFrameFire", GameGetFrameNum()) end
     end
 end
 
--- ── Respawn: restore HP and teleport to recorded spawn ───────────────────
+-- ── Respawn: teleport to spawn, reset virtual HP, flush status effects ───
 local function respawn_player(player)
-    local dmg = EntityGetFirstComponent(player, "DamageModelComponent")
-    if dmg then
-        local max_hp = cget(dmg, "max_hp") or 4
-        cset(dmg, "hp", max_hp)
-    end
-    if spawn_x then
+    virtual_hp = VIRTUAL_MAX_HP
+
+    if spawn_x and spawn_y then
         local ok, e = pcall(EntitySetTransform, player, spawn_x, spawn_y)
         if not ok then warn("EntitySetTransform failed: " .. tostring(e)) end
     end
+
     local cdata = EntityGetFirstComponent(player, "CharacterDataComponent")
-    if cdata then cset(cdata, "mVelocity", 0, 0) end
+    if cdata then
+        cset(cdata, "mVelocity", 0, 0)
+        cset(cdata, "mFlyingTimeLeft", 1000.0)
+    end
+
+    -- Remove fire/toxic stain effects, then douse with water for good measure
+    pcall(EntityRemoveStainStatusEffect,     player, "stain_fire")
+    pcall(EntityRemoveStainStatusEffect,     player, "stain_radioactive_gas_1")
+    pcall(EntityRemoveIngestionStatusEffect, player, "RADIOACTIVE")
+    local water_id = CellFactory_GetType("water")
+    pcall(EntityAddRandomStains, player, water_id, 400)
 
     episode_num    = episode_num + 1
     episode_steps  = 0
@@ -177,22 +228,15 @@ local function draw_radar(g, ox, oy, rays)
     GuiColorSetForNextWidget(g, 1, 1, 1, 1)
 end
 
--- ── 5 downward liquid sensors ─────────────────────────────────────────────
--- For each angle: RaytraceSurfacesAndLiquiform hits liquid surface,
--- RaytracePlatforms passes through liquid to solid floor.
--- Signal = (d_solid - d_liquid) / ray_len; 0 = dry, ~1 = pool right there.
-local LIQUID_ANGLES = {
-    math.pi * 1/4,  -- down-right
-    math.pi * 1/3,
-    math.pi / 2,    -- straight down
-    math.pi * 2/3,
-    math.pi * 3/4,  -- down-left
-}
+-- ── 8-direction liquid sensors ────────────────────────────────────────────
+-- Signal per ray: (d_solid - d_liquid) / LIQUID_LEN
+--   0 = dry or no difference,  ~1 = liquid pool right in front
 local LIQUID_LEN = 80
 
 local function build_liquid_sensors(x, y)
     local out = {}
-    for _, angle in ipairs(LIQUID_ANGLES) do
+    for i = 0, 7 do
+        local angle = i * (math.pi / 4)  -- 8 compass directions
         local tx = x + math.cos(angle) * LIQUID_LEN
         local ty = y + math.sin(angle) * LIQUID_LEN
 
@@ -202,9 +246,105 @@ local function build_liquid_sensors(x, y)
         local d1 = (ok1 and hit1) and math.sqrt((hx1-x)^2+(hy1-y)^2) or LIQUID_LEN
         local d2 = (ok2 and hit2) and math.sqrt((hx2-x)^2+(hy2-y)^2) or LIQUID_LEN
 
-        table.insert(out, math.max(0.0, (d2 - d1) / LIQUID_LEN))
+        out[i+1] = math.max(0.0, (d2 - d1) / LIQUID_LEN)
     end
     return out
+end
+
+-- ── 8-sector enemy radar ──────────────────────────────────────────────────
+-- Each sector returns normalised distance to nearest enemy (1.0 = none).
+local ENEMY_RANGE = 200
+
+local function build_enemy_radar(x, y)
+    local sectors = {1,1,1,1,1,1,1,1}
+    local ok, enemies = pcall(EntityGetInRadiusWithTag, x, y, ENEMY_RANGE, "enemy")
+    if not ok or not enemies then return sectors end
+    for _, eid in ipairs(enemies) do
+        local tok, ex, ey = pcall(EntityGetTransform, eid)
+        if tok then
+            local dx, dy = ex - x, ey - y
+            local dist   = math.sqrt(dx*dx + dy*dy)
+            if dist > 0 then
+                local norm   = math.min(dist / ENEMY_RANGE, 1.0)
+                local angle  = math.atan2(dy, dx)                     -- -π..π
+                local sector = math.floor((angle + math.pi) / (2*math.pi) * 8 + 0.5) % 8 + 1
+                if norm < sectors[sector] then sectors[sector] = norm end
+            end
+        end
+    end
+    return sectors
+end
+
+-- ── 8-sector projectile radar ────────────────────────────────────────────
+-- Each sector returns normalised distance to nearest incoming projectile (1.0 = none).
+local PROJECTILE_RANGE = 150
+
+local function build_projectile_radar(x, y)
+    local sectors = {1,1,1,1,1,1,1,1}
+    local ok, projs = pcall(EntityGetInRadiusWithTag, x, y, PROJECTILE_RANGE, "projectile")
+    if not ok or not projs then return sectors end
+    for _, pid in ipairs(projs) do
+        local tok, px, py = pcall(EntityGetTransform, pid)
+        if tok then
+            local dx, dy = px - x, py - y
+            local dist   = math.sqrt(dx*dx + dy*dy)
+            if dist > 0 then
+                local norm   = math.min(dist / PROJECTILE_RANGE, 1.0)
+                local angle  = math.atan2(dy, dx)
+                local sector = math.floor((angle + math.pi) / (2*math.pi) * 8 + 0.5) % 8 + 1
+                if norm < sectors[sector] then sectors[sector] = norm end
+            end
+        end
+    end
+    return sectors
+end
+
+-- ── 8-sector gold/loot radar ─────────────────────────────────────────────
+-- Signal: 1=no gold nearby, 0=gold at player position.
+local GOLD_RANGE = 150
+
+local function build_gold_radar(x, y)
+    local sectors = {1,1,1,1,1,1,1,1}
+    local ok, nuggets = pcall(EntityGetInRadiusWithTag, x, y, GOLD_RANGE, "gold_nugget")
+    if not ok or not nuggets then return sectors end
+    for _, gid in ipairs(nuggets) do
+        local tok, gx, gy = pcall(EntityGetTransform, gid)
+        if tok then
+            local dx, dy = gx - x, gy - y
+            local dist   = math.sqrt(dx*dx + dy*dy)
+            if dist > 0 then
+                local norm   = math.min(dist / GOLD_RANGE, 1.0)
+                local angle  = math.atan2(dy, dx)
+                local sector = math.floor((angle + math.pi) / (2*math.pi) * 8 + 0.5) % 8 + 1
+                if norm < sectors[sector] then sectors[sector] = norm end
+            end
+        end
+    end
+    return sectors
+end
+
+-- ── Jetpack fuel (0=empty, 1=full) ───────────────────────────────────────
+local JETPACK_MAX = 1000.0   -- default mFlyingTimeLeft value = full tank
+
+local function get_jetpack_fuel(player)
+    local cdata = EntityGetFirstComponent(player, "CharacterDataComponent")
+    if not cdata then return 1.0 end
+    local left = cget(cdata, "mFlyingTimeLeft") or JETPACK_MAX
+    return math.max(0.0, math.min(1.0, left / JETPACK_MAX))
+end
+
+-- ── Wand ready (1=can fire, 0=on cooldown) ───────────────────────────────
+local function get_wand_ready(player)
+    local frame    = GameGetFrameNum()
+    local children = EntityGetAllChildren(player) or {}
+    for _, child in ipairs(children) do
+        local ab = EntityGetFirstComponent(child, "AbilityComponent")
+        if ab then
+            local next_use = cget(ab, "mNextFrameUsable") or 0
+            return (frame >= next_use) and 1.0 or 0.0
+        end
+    end
+    return 1.0
 end
 
 -- ── Build 16-ray state table ──────────────────────────────────────────────
@@ -343,13 +483,18 @@ function OnWorldPostUpdate()
         info(string.format("Spawn recorded (%.0f, %.0f)", x, y))
     end
 
-    local hp = 1.0
+    -- Virtual-HP system: keep engine HP at IMMORTAL_HP so Noita never kills
+    -- the player entity; track damage in virtual_hp ourselves.
     local dmg = EntityGetFirstComponent(player, "DamageModelComponent")
     if dmg then
-        local raw_hp  = cget(dmg, "hp")    or 0
-        local raw_max = cget(dmg, "max_hp") or 1
-        if raw_max > 0 then hp = raw_hp / raw_max end
+        cset(dmg, "max_hp", IMMORTAL_HP)
+        local engine_hp = cget(dmg, "hp") or IMMORTAL_HP
+        if engine_hp < IMMORTAL_HP then
+            virtual_hp = virtual_hp - (IMMORTAL_HP - engine_hp)
+            cset(dmg, "hp", IMMORTAL_HP)
+        end
     end
+    local hp_norm = math.max(0.0, virtual_hp / VIRTUAL_MAX_HP)
 
     local vx, vy, on_ground = 0.0, 0.0, false
     local cdata = EntityGetFirstComponent(player, "CharacterDataComponent")
@@ -359,8 +504,27 @@ function OnWorldPostUpdate()
         vx = vx or 0; vy = vy or 0; on_ground = on_ground or false
     end
 
-    local rays           = build_rays(x, y)
-    local liquid_sensors = build_liquid_sensors(x, y)
+    local rays             = build_rays(x, y)
+    local liquid_sensors   = build_liquid_sensors(x, y)
+    local enemy_radar      = build_enemy_radar(x, y)
+    local projectile_radar = build_projectile_radar(x, y)
+    local gold_radar       = build_gold_radar(x, y)
+    local jetpack_fuel     = get_jetpack_fuel(player)
+    local wand_ready       = get_wand_ready(player)
+
+    local ok1, fc1 = pcall(GameGetGameEffectCount, player, "ON_FIRE")
+    local is_on_fire  = (ok1 and fc1 and fc1 > 0) and 1.0 or 0.0
+    local ok2, fc2 = pcall(GameGetGameEffectCount, player, "RADIOACTIVE")
+    local is_poisoned = (ok2 and fc2 and fc2 > 0) and 1.0 or 0.0
+
+    -- Sky visibility: 1=open sky, 0=deep underground (depth proxy)
+    local sky_ok, sky_v = pcall(GameGetSkyVisibility, x, y)
+    local sky_visibility = (sky_ok and sky_v) and math.max(0.0, math.min(1.0, sky_v)) or 0.0
+
+    -- Current gold for reward tracking in Python
+    local gold = 0
+    local wallet = EntityGetFirstComponent(player, "WalletComponent")
+    if wallet then gold = cget(wallet, "money") or 0 end
 
     -- Draw radar ───────────────────────────────────────────────────────────
     GuiIdPushString(gui, "rl_radar")
@@ -372,29 +536,40 @@ function OnWorldPostUpdate()
     -- Periodic diagnostic log ──────────────────────────────────────────────
     if (frame % 300) == 0 then
         info(string.format(
-            "DIAG ep=%d step=%d pos=(%.0f,%.0f) vel=(%.1f,%.1f) hp=%.2f gnd=%s act=%s fps=%.0f",
-            episode_num, episode_steps, x, y, vx, vy, hp,
+            "DIAG ep=%d step=%d pos=(%.0f,%.0f) vel=(%.1f,%.1f) vhp=%.2f gnd=%s act=%s fps=%.0f",
+            episode_num, episode_steps, x, y, vx, vy, virtual_hp,
             tostring(on_ground), ACTION_NAMES[last_action] or "?", fps))
     end
 
-    -- Death detection ──────────────────────────────────────────────────────
-    if hp <= DEATH_HP then
-        info(string.format("Ep %d ended  steps=%d  pos=(%.0f,%.0f)  hp=%.3f",
-            episode_num, episode_steps, x, y, hp))
+    -- Death detection (virtual HP exhausted) ─────────────────────────────
+    if virtual_hp <= 0.0 then
+        info(string.format("Ep %d ended  steps=%d  pos=(%.0f,%.0f)  vhp=%.3f",
+            episode_num, episode_steps, x, y, virtual_hp))
         local dead_state = {
             x=x, y=y, hp=0.0, vx=0.0, vy=0.0,
-            rays=rays, dead=true, on_ground=false
+            rays=rays, liquid_sensors=liquid_sensors, enemy_radar=enemy_radar,
+            projectile_radar=projectile_radar, gold_radar=gold_radar,
+            jetpack_fuel=1.0, wand_ready=1.0,
+            is_on_fire=0.0, is_poisoned=0.0, sky_visibility=sky_visibility,
+            gold=gold,
+            dead=true, on_ground=false, frame=frame
         }
         local ok4, encoded = pcall(json.encode, dead_state)
-        if ok4 then
-            pcall(socket.send, socket, encoded)
-        end
+        if ok4 then pcall(socket.send, socket, encoded) end
         respawn_player(player)
         return
     end
 
     -- Send live state ──────────────────────────────────────────────────────
-    local state = {x=x, y=y, hp=hp, vx=vx, vy=vy, rays=rays, liquid_sensors=liquid_sensors, dead=false, on_ground=on_ground, frame=frame}
+    local state = {
+        x=x, y=y, hp=hp_norm, vx=vx, vy=vy,
+        rays=rays, liquid_sensors=liquid_sensors, enemy_radar=enemy_radar,
+        projectile_radar=projectile_radar, gold_radar=gold_radar,
+        jetpack_fuel=jetpack_fuel, wand_ready=wand_ready,
+        is_on_fire=is_on_fire, is_poisoned=is_poisoned,
+        sky_visibility=sky_visibility, gold=gold,
+        dead=false, on_ground=on_ground, frame=frame
+    }
     local ok5, encoded = pcall(json.encode, state)
     if ok5 then
         local ok6, send_err = pcall(socket.send, socket, encoded)
