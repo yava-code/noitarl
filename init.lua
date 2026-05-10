@@ -79,6 +79,7 @@ local gui                       = nil
 local MOVE_SPEED     = 60
 local JUMP_SPEED     = -150
 local DEATH_HP       = 0.02
+local FRAME_SKIP     = 4     -- accept new action / send state every N frames
 
 -- ── Per-frame state ───────────────────────────────────────────────────────
 local pending_action  = 0
@@ -174,6 +175,36 @@ local function draw_radar(g, ox, oy, rays)
         end
     end
     GuiColorSetForNextWidget(g, 1, 1, 1, 1)
+end
+
+-- ── 5 downward liquid sensors ─────────────────────────────────────────────
+-- For each angle: RaytraceSurfacesAndLiquiform hits liquid surface,
+-- RaytracePlatforms passes through liquid to solid floor.
+-- Signal = (d_solid - d_liquid) / ray_len; 0 = dry, ~1 = pool right there.
+local LIQUID_ANGLES = {
+    math.pi * 1/4,  -- down-right
+    math.pi * 1/3,
+    math.pi / 2,    -- straight down
+    math.pi * 2/3,
+    math.pi * 3/4,  -- down-left
+}
+local LIQUID_LEN = 80
+
+local function build_liquid_sensors(x, y)
+    local out = {}
+    for _, angle in ipairs(LIQUID_ANGLES) do
+        local tx = x + math.cos(angle) * LIQUID_LEN
+        local ty = y + math.sin(angle) * LIQUID_LEN
+
+        local ok1, hit1, hx1, hy1 = pcall(RaytraceSurfacesAndLiquiform, x, y, tx, ty)
+        local ok2, hit2, hx2, hy2 = pcall(RaytracePlatforms,            x, y, tx, ty)
+
+        local d1 = (ok1 and hit1) and math.sqrt((hx1-x)^2+(hy1-y)^2) or LIQUID_LEN
+        local d2 = (ok2 and hit2) and math.sqrt((hx2-x)^2+(hy2-y)^2) or LIQUID_LEN
+
+        table.insert(out, math.max(0.0, (d2 - d1) / LIQUID_LEN))
+    end
+    return out
 end
 
 -- ── Build 16-ray state table ──────────────────────────────────────────────
@@ -295,6 +326,9 @@ function OnWorldPostUpdate()
     if st ~= "open" then return end
     if not player then return end
 
+    -- Frame skip: build/send state only every FRAME_SKIP frames ───────────
+    if (frame % FRAME_SKIP) ~= 0 then return end
+
     -- Player state ─────────────────────────────────────────────────────────
     local x, y
     do
@@ -325,7 +359,8 @@ function OnWorldPostUpdate()
         vx = vx or 0; vy = vy or 0; on_ground = on_ground or false
     end
 
-    local rays = build_rays(x, y)
+    local rays           = build_rays(x, y)
+    local liquid_sensors = build_liquid_sensors(x, y)
 
     -- Draw radar ───────────────────────────────────────────────────────────
     GuiIdPushString(gui, "rl_radar")
@@ -359,7 +394,7 @@ function OnWorldPostUpdate()
     end
 
     -- Send live state ──────────────────────────────────────────────────────
-    local state = {x=x, y=y, hp=hp, vx=vx, vy=vy, rays=rays, dead=false, on_ground=on_ground, frame=frame}
+    local state = {x=x, y=y, hp=hp, vx=vx, vy=vy, rays=rays, liquid_sensors=liquid_sensors, dead=false, on_ground=on_ground, frame=frame}
     local ok5, encoded = pcall(json.encode, state)
     if ok5 then
         local ok6, send_err = pcall(socket.send, socket, encoded)

@@ -37,7 +37,7 @@ class NoitaEnv(gym.Env):
 
         self.action_space = gym.spaces.Discrete(5)
         self.observation_space = gym.spaces.Box(
-            low=0.0, high=1.0, shape=(20,), dtype=np.float32
+            low=0.0, high=1.0, shape=(25,), dtype=np.float32
         )
 
         # WebSocket state (written by WS thread, read by main thread)
@@ -130,15 +130,22 @@ class NoitaEnv(gym.Env):
 
     def _obs_from_state(self, state: Optional[dict]) -> np.ndarray:
         if state is None:
-            return np.zeros(20, dtype=np.float32)
+            return np.zeros(25, dtype=np.float32)
         vx  = float(np.clip(state.get("vx", 0.0) / 200.0, -1.0, 1.0)) * 0.5 + 0.5
         vy  = float(np.clip(state.get("vy", 0.0) / 200.0, -1.0, 1.0)) * 0.5 + 0.5
         gnd = 1.0 if state.get("on_ground", False) else 0.0
+
         rays = state.get("rays", [1.0] * 16)
         if len(rays) != 16:
             logger.warning("[env:{}] Expected 16 rays, got {}", self.port, len(rays))
             rays = (rays + [1.0] * 16)[:16]
-        return np.array(rays + [state.get("hp", 1.0), vx, vy, gnd], dtype=np.float32)
+
+        # 5 liquid sensors (0=dry, ~1=pool ahead); default 0 if not sent (dead state)
+        liquids = state.get("liquid_sensors", [0.0] * 5)
+        if len(liquids) != 5:
+            liquids = (liquids + [0.0] * 5)[:5]
+
+        return np.array(rays + [state.get("hp", 1.0), vx, vy, gnd] + liquids, dtype=np.float32)
 
     # ── Gymnasium interface ───────────────────────────────────────────────────
 
@@ -193,27 +200,23 @@ class NoitaEnv(gym.Env):
         dead       = state.get("dead", False)
 
         # ── Reward ────────────────────────────────────────────────────────────
-        reward = 0.01   # survival
+        # Time tax: стоять невыгодно, единственный способ в плюс — идти глубже.
+        reward = -0.005
 
-        # Horizontal exploration: reward any x movement (encourages not standing still)
-        dx = abs(current_x - self.last_x)
-        reward += min(dx, 30.0) * 0.005    # capped so one big jump isn't outsized
-
-        # Depth progress (Noita +Y = deeper underground)
+        # Единственный источник плюса — новая глубина.
         if current_y > self.max_depth_y:
-            reward += (current_y - self.max_depth_y) * 0.3
+            reward += (current_y - self.max_depth_y) * 0.5
             self.max_depth_y = current_y
 
-        # Damage penalty — reduced so agent isn't too scared to explore
+        # Штраф за урон.
         if current_hp < self.last_hp:
             reward -= (self.last_hp - current_hp) * 3.0
 
-        # Death penalty
+        # Штраф за смерть.
         if dead:
             reward -= 1.0
 
         self.last_hp         = current_hp
-        self.last_x          = current_x
         self.episode_steps  += 1
         self.episode_reward += reward
 
