@@ -90,9 +90,9 @@ separate action; action 7 forces aim straight down ("dig").
 | 0 | IDLE       — vx target = 0, no jump, no fire |
 | 1 | LEFT       — vx = −60 |
 | 2 | RIGHT      — vx = +60 |
-| 3 | JUMP       — vy = −150 (on ground) / jetpack (in air, vy -= 25) |
-| 4 | LEFT+JUMP  — vx = −60 AND jump/jetpack |
-| 5 | RIGHT+JUMP — vx = +60 AND jump/jetpack |
+| 3 | JUMP       — vy = −150 (only when on_ground; no-op airborne) |
+| 4 | LEFT+JUMP  — vx = −60 AND jump (vertical part only triggers grounded) |
+| 5 | RIGHT+JUMP — vx = +60 AND jump (vertical part only triggers grounded) |
 | 6 | FIRE       — auto-aim at nearest enemy, fire wand |
 | 7 | FIRE_DOWN  — aim straight down, fire wand (used for digging) |
 
@@ -164,6 +164,16 @@ python train_multi.py --envs 2 --resume checkpoints/noita_ppo_2env_400000_steps.
   restarting the game.
 - **Spawn randomization** uses a `spawn_candidates` pool with `±30 px` X jitter
   to prevent the policy from overfitting to one corridor entrance.
+- **Initial descent into the Mines.** The surface biome has no corridor
+  structure, so the agent just wanders. On the first frame after connect we
+  raycast straight down from the surface spawn and teleport the player onto
+  the first platform below (`INITIAL_DESCENT_RANGE = 1500 px`,
+  `INITIAL_DESCENT_LIFT = 20 px`). That post-descent position is what
+  `spawn_candidates` records — every subsequent respawn lands underground.
+- **Jetpack is disabled.** The `JUMP` actions (3, 4, 5) only set `vy =
+  JUMP_SPEED` when `is_on_ground` is true. Airborne, they are vertically
+  no-ops. Re-enabling jetpack lets the agent farm sky-chunk curiosity
+  indefinitely by flying upward.
 - **Action trace log**: every applied action is appended as one JSON line to
   `actions_trace.jsonl` (5 MB rotation). Useful for verifying that the agent's
   intended action actually became a `vx/vy` change on the physics tick.

@@ -31,7 +31,7 @@ local function err(m)   log("ERROR", m) end
 
 -- Clear log on each start so it doesn't grow forever
 do local f = io.open(LOG_FILE, "w"); if f then f:close() end end
-info("Mod init started — noitarl v0.3 (Discrete 8, no smoothing)")
+info("Mod init started — noitarl v0.4 (no jetpack, auto-descent into Mines)")
 
 -- ── Safe component accessors ──────────────────────────────────────────────
 -- Noita's ComponentGetValue2 / ComponentSetValue2 silently crash if the
@@ -78,10 +78,20 @@ local gui                       = nil
 -- ── Movement constants ────────────────────────────────────────────────────
 local MOVE_SPEED     = 60
 local JUMP_SPEED     = -150
-local JETPACK_THRUST = 25     -- per-frame vy delta while jetpack active (was 12)
-local JETPACK_DRAIN  = 20
-local JETPACK_VY_CAP = -250
 local FRAME_SKIP     = 4      -- accept new action / send state every N frames
+
+-- Jetpack is intentionally disabled — actions 3/4/5 are no-ops vertically
+-- when airborne. Without this constraint the agent learns to fly to the
+-- ceiling and farms exploration bonus from sky chunks indefinitely.
+
+-- ── Initial descent: drop the player from the surface into the Mines on ──
+-- the very first frame, then make THAT the spawn point. The surface biome
+-- is open and lacks the narrow corridors that make Noita interesting; if
+-- the agent is left on the surface it wanders aimlessly. We raycast
+-- straight down and land just above the first platform we hit.
+local INITIAL_DESCENT_RANGE  = 1500   -- max px below surface to search
+local INITIAL_DESCENT_LIFT   = 20     -- gap above the platform we land on
+local initial_descent_done   = false
 
 -- Immortal-agent HP hack: engine never kills the player;
 -- we track "virtual HP" ourselves and teleport-respawn when it hits 0.
@@ -159,7 +169,6 @@ local function apply_action(player, action)
     if cdata then
         local cur_vx, cur_vy = cget(cdata, "mVelocity")
         local on_ground      = cget(cdata, "is_on_ground")
-        local fuel           = cget(cdata, "mFlyingTimeLeft") or 1000
         cur_vx = cur_vx or 0; cur_vy = cur_vy or 0
         on_ground_now = on_ground == true
 
@@ -168,18 +177,13 @@ local function apply_action(player, action)
         local target_vx = move_x * MOVE_SPEED
         local new_vx    = target_vx
 
-        -- Vertical: keep current vy, modify on jump/jetpack
+        -- Vertical: jump only fires when grounded. No jetpack — see comment
+        -- near JUMP_SPEED for why. In-air JUMP becomes a no-op vertically.
         local new_vy = cur_vy
-        if do_jump then
-            if on_ground_now then
-                new_vy = JUMP_SPEED
-            elseif fuel > 0 then
-                new_vy = math.max(cur_vy - JETPACK_THRUST, JETPACK_VY_CAP)
-                fuel   = math.max(0, fuel - JETPACK_DRAIN)
-            end
+        if do_jump and on_ground_now then
+            new_vy = JUMP_SPEED
         end
 
-        cset(cdata, "mFlyingTimeLeft", fuel)
         cset(cdata, "mVelocity", new_vx, new_vy)
         vx_out, vy_out = new_vx, new_vy
     end
@@ -565,11 +569,34 @@ function OnWorldPostUpdate()
         x, y = ex, ey
     end
 
+    local cdata = EntityGetFirstComponent(player, "CharacterDataComponent")
+
     if not spawn_x then
-        spawn_x, spawn_y = x, y
-        spawn_candidates[#spawn_candidates + 1] = { x = x, y = y }
+        -- First frame: drop the player from the surface into the Mines.
+        -- The surface biome is open terrain with no corridors — the agent
+        -- wanders aimlessly there. We raycast straight down to find the
+        -- first platform and teleport just above it.
+        local target_x, target_y = x, y + 400  -- fallback if raycast misses
+        local rok, hit, _hx, hy = pcall(
+            RaytracePlatforms, x, y + 10, x, y + INITIAL_DESCENT_RANGE
+        )
+        if rok and hit then
+            target_y = hy - INITIAL_DESCENT_LIFT
+        end
+
+        pcall(EntitySetTransform, player, target_x, target_y)
+        if cdata then cset(cdata, "mVelocity", 0, 0) end
+
+        spawn_x, spawn_y = target_x, target_y
+        spawn_candidates[#spawn_candidates + 1] = { x = target_x, y = target_y }
+        initial_descent_done = true
         episode_num = 1
-        info(string.format("Spawn recorded (%.0f, %.0f)", x, y))
+        info(string.format(
+            "Spawn recorded (%.0f, %.0f) — descended from surface (%.0f, %.0f)",
+            target_x, target_y, x, y))
+
+        -- Reflect the teleport in this frame's state so observation is correct
+        x, y = target_x, target_y
     end
 
     -- Virtual-HP system: keep engine HP at IMMORTAL_HP so Noita never kills
@@ -586,9 +613,8 @@ function OnWorldPostUpdate()
     local hp_norm = math.max(0.0, virtual_hp / VIRTUAL_MAX_HP)
 
     local vx, vy, on_ground = 0.0, 0.0, false
-    local cdata = EntityGetFirstComponent(player, "CharacterDataComponent")
     if cdata then
-        vx, vy   = cget(cdata, "mVelocity")
+        vx, vy    = cget(cdata, "mVelocity")
         on_ground = cget(cdata, "is_on_ground")
         vx = vx or 0; vy = vy or 0; on_ground = on_ground or false
     end
