@@ -17,3 +17,5 @@
 [02:03:02] [INFO ] DIAG ep=1 step=854 pos=(440,36) vel=(-1.9,-112.5) vhp=4.00 gnd=false act=JUMP fps=60
 [02:03:07] [INFO ] DIAG ep=1 step=929 pos=(436,59) vel=(8.2,-75.2) vhp=4.00 gnd=false act=RIGHT fps=60
 [02:03:12] [INFO ] DIAG ep=1 step=1004 pos=(440,94) vel=(3.9,60.0) vhp=4.00 gnd=true act=IDLE fps=60
+[02:03:17] [INFO ] DIAG ep=1 step=1079 pos=(449,52) vel=(0.2,-51.8) vhp=4.00 gnd=false act=LEFT fps=60
+[02:03:22] [INFO ] DIAG ep=1 step=1154 pos=(443,76) vel=(4.3,129.5) vhp=4.00 gnd=false act=IDLE fps=60
