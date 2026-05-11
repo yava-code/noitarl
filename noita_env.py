@@ -200,6 +200,11 @@ class NoitaEnv(gym.Env):
 
         logger.debug("[env:{}] reset() — episode {}", self.port, self.episode_num)
 
+        # Tell Lua to teleport back to spawn (handles both normal death and step-limit timeout)
+        self._send_action(99)
+        with self._lock:
+            self._state = None   # discard stale state; wait for fresh one after respawn
+
         if not self._wait_for_live_state(timeout=60.0):
             logger.error("[env:{}] reset() timed out — is Noita running?", self.port)
 

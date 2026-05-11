@@ -90,6 +90,7 @@ local virtual_hp     = VIRTUAL_MAX_HP
 local pending_action  = 0
 local last_action     = 0
 local ACTION_NAMES    = {[0]="IDLE",[1]="LEFT",[2]="RIGHT",[3]="JUMP",[4]="FIRE"}
+local FORCE_RESPAWN   = 99   -- special signal from Python to force episode reset
 
 -- ── Episode tracking ──────────────────────────────────────────────────────
 local spawn_x, spawn_y = 400.0, 50.0  -- entrance to the first mines
@@ -101,6 +102,14 @@ local PERF_WINDOW      = 60
 -- ── Apply action: smoothed velocity + manual jetpack ─────────────────────
 local function apply_action(player, action)
     if not player or player == 0 then return end
+
+    -- Special signal: Python ended the episode via step-limit; teleport back to spawn
+    if action == FORCE_RESPAWN then
+        respawn_player(player)
+        pending_action = 0
+        return
+    end
+
     last_action = action
 
     local cdata = EntityGetFirstComponent(player, "CharacterDataComponent")
