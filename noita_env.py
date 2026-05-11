@@ -63,6 +63,7 @@ class NoitaEnv(gym.Env):
         self.last_x         = 0.0
         self.max_depth_y    = 0.0
         self.last_gold      = 0
+        self.last_kills     = 0
 
         self._start_server()
         logger.info("[env:{}] WebSocket server on {}:{}", port, host, port)
@@ -194,6 +195,7 @@ class NoitaEnv(gym.Env):
         self.last_hp         = 1.0
         self.max_depth_y     = 0.0
         self.last_gold       = 0
+        self.last_kills      = 0
         self.visited_chunks: set = set()
 
         logger.debug("[env:{}] reset() — episode {}", self.port, self.episode_num)
@@ -206,6 +208,8 @@ class NoitaEnv(gym.Env):
             self.last_hp     = s.get("hp", 1.0)
             self.max_depth_y = s.get("y", 0.0)
             self.last_x      = s.get("x", 0.0)
+            self.last_gold   = s.get("gold",  0)
+            self.last_kills  = s.get("kills", 0)
 
         return self._obs_from_state(s), {}
 
@@ -262,6 +266,20 @@ class NoitaEnv(gym.Env):
         if current_gold > self.last_gold:
             reward += (current_gold - self.last_gold) * 0.001
         self.last_gold = current_gold
+
+        # Награда за убийства.
+        current_kills = state.get("kills", 0)
+        if current_kills > self.last_kills:
+            reward += (current_kills - self.last_kills) * 10.0
+        self.last_kills = current_kills
+
+        # Reward shaping: поощряем стрельбу по врагу, штрафуем стрельбу в пустоту.
+        if action == 4:
+            enemy_radar = state.get("enemy_radar", [1.0] * 8)
+            if any(v < 1.0 for v in enemy_radar):
+                reward += 0.05   # враг виден — молодец, стреляешь
+            else:
+                reward -= 0.02   # стреляешь в пустоту — штраф
 
         # Штраф за смерть.
         if dead:

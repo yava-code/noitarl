@@ -92,7 +92,7 @@ local last_action     = 0
 local ACTION_NAMES    = {[0]="IDLE",[1]="LEFT",[2]="RIGHT",[3]="JUMP",[4]="FIRE"}
 
 -- ── Episode tracking ──────────────────────────────────────────────────────
-local spawn_x, spawn_y = nil, nil
+local spawn_x, spawn_y = 400.0, 50.0  -- entrance to the first mines
 local episode_num      = 0
 local episode_steps    = 0
 local frame_times      = {}   -- rolling window for FPS estimate
@@ -135,7 +135,7 @@ local function apply_action(player, action)
     -- Fire + auto-aim on ControlsComponent
     local ctrl = EntityGetFirstComponent(player, "ControlsComponent")
     if ctrl then
-        -- Auto-aim: track nearest enemy every frame so wand is always pointing correctly
+        -- Auto-aim: track nearest enemy every frame
         local tok, px, py = pcall(EntityGetTransform, player)
         if tok then
             local aok, enemies = pcall(EntityGetInRadiusWithTag, px, py, 250, "enemy")
@@ -145,8 +145,9 @@ local function apply_action(player, action)
                 for _, eid in ipairs(enemies) do
                     local eok, ex, ey = pcall(EntityGetTransform, eid)
                     if eok then
-                        local d2 = (ex-px)^2 + (ey-py)^2
-                        if d2 < nearest_d2 then nearest_d2, nx, ny = d2, ex, ey end
+                        -- Aim slightly below the top (+4 px) so shots land on body, not above
+                        local d2 = (ex-px)^2 + ((ey+4)-py)^2
+                        if d2 < nearest_d2 then nearest_d2, nx, ny = d2, ex, ey+4 end
                     end
                 end
             end
@@ -154,7 +155,9 @@ local function apply_action(player, action)
             local len = math.sqrt(dx*dx + dy*dy)
             if len > 0.001 then
                 cset(ctrl, "mAimingVectorNormalized", dx/len, dy/len)
-                cset(ctrl, "mMousePosition",          nx,     ny)
+                -- mMousePosition is a vec2 but the engine reads X/Y separately
+                cset(ctrl, "mMousePositionX", nx)
+                cset(ctrl, "mMousePositionY", ny)
             end
         end
 
@@ -521,10 +524,13 @@ function OnWorldPostUpdate()
     local sky_ok, sky_v = pcall(GameGetSkyVisibility, x, y)
     local sky_visibility = (sky_ok and sky_v) and math.max(0.0, math.min(1.0, sky_v)) or 0.0
 
-    -- Current gold for reward tracking in Python
+    -- Current gold and kill count for reward tracking in Python
     local gold = 0
     local wallet = EntityGetFirstComponent(player, "WalletComponent")
     if wallet then gold = cget(wallet, "money") or 0 end
+
+    local ok_st, k_str = pcall(StatsGetValue, "enemies_killed")
+    local kills = (ok_st and k_str) and tonumber(k_str) or 0
 
     -- Draw radar ───────────────────────────────────────────────────────────
     GuiIdPushString(gui, "rl_radar")
@@ -551,7 +557,7 @@ function OnWorldPostUpdate()
             projectile_radar=projectile_radar, gold_radar=gold_radar,
             jetpack_fuel=1.0, wand_ready=1.0,
             is_on_fire=0.0, is_poisoned=0.0, sky_visibility=sky_visibility,
-            gold=gold,
+            gold=gold, kills=kills,
             dead=true, on_ground=false, frame=frame
         }
         local ok4, encoded = pcall(json.encode, dead_state)
@@ -567,7 +573,7 @@ function OnWorldPostUpdate()
         projectile_radar=projectile_radar, gold_radar=gold_radar,
         jetpack_fuel=jetpack_fuel, wand_ready=wand_ready,
         is_on_fire=is_on_fire, is_poisoned=is_poisoned,
-        sky_visibility=sky_visibility, gold=gold,
+        sky_visibility=sky_visibility, gold=gold, kills=kills,
         dead=false, on_ground=on_ground, frame=frame
     }
     local ok5, encoded = pcall(json.encode, state)
