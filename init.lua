@@ -139,13 +139,12 @@ local function apply_action(player, action)
         local tok, px, py = pcall(EntityGetTransform, player)
         if tok then
             local aok, enemies = pcall(EntityGetInRadiusWithTag, px, py, 250, "enemy")
-            local nx, ny = px + 50, py   -- default: face right when no enemies
+            local nx, ny = px + 50, py   -- default: face right
             if aok and enemies and #enemies > 0 then
                 local nearest_d2 = math.huge
                 for _, eid in ipairs(enemies) do
                     local eok, ex, ey = pcall(EntityGetTransform, eid)
                     if eok then
-                        -- Aim slightly below the top (+4 px) so shots land on body, not above
                         local d2 = (ex-px)^2 + ((ey+4)-py)^2
                         if d2 < nearest_d2 then nearest_d2, nx, ny = d2, ex, ey+4 end
                     end
@@ -155,15 +154,23 @@ local function apply_action(player, action)
             local len = math.sqrt(dx*dx + dy*dy)
             if len > 0.001 then
                 cset(ctrl, "mAimingVectorNormalized", dx/len, dy/len)
-                -- mMousePosition is a vec2 but the engine reads X/Y separately
-                cset(ctrl, "mMousePositionX", nx)
-                cset(ctrl, "mMousePositionY", ny)
+                cset(ctrl, "mMousePosition", nx, ny)   -- vec2 field, two floats
             end
         end
 
-        local fire = (action == 4)
-        cset(ctrl, "mButtonDownFire", fire)
-        if fire then cset(ctrl, "mButtonFrameFire", GameGetFrameNum()) end
+        -- Fire: only update mButtonFrameFire on the rising edge so cast_delay isn't
+        -- reset every frame (which would prevent any projectile from actually launching).
+        local fire     = (action == 4)
+        local was_fire = (cget(ctrl, "mButtonDownFire") == true)
+
+        cset(ctrl, "mButtonDownFire",      fire)
+        cset(ctrl, "mButtonDownLeftClick", fire)
+
+        if fire and not was_fire then
+            local frame = GameGetFrameNum()
+            cset(ctrl, "mButtonFrameFire",      frame)
+            cset(ctrl, "mButtonFrameLeftClick", frame)
+        end
     end
 end
 
