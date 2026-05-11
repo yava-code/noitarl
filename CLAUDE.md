@@ -61,34 +61,60 @@ by `PlayerCollisionSystem`.
 
 ---
 
-## Observation space (20 float32, all in [0, 1])
+## Observation space (57 float32, all in [0, 1])
 
-| Index | Feature | Notes |
-|-------|---------|-------|
-| 0–15  | 16 raytrace sensors | angle = i × π/8; 0 = wall at player, 1 = 150 px clear |
-| 16    | hp fraction | 0 = dead, 1 = full health |
-| 17    | vx normalised | (−200..+200) → (0..1) |
-| 18    | vy normalised | positive vy = falling |
-| 19    | on_ground | 0 or 1 |
+| Index   | Feature | Notes |
+|---------|---------|-------|
+| 0–15    | 16 platform rays   | RaytracePlatforms; 0 = wall, 1 = 150 px clear |
+| 16–23   | 8 enemy radar      | 1 = none, 0 = enemy at player (200 px range) |
+| 24–31   | 8 liquid sensors   | 0 = dry, ~1 = liquid pool ahead (80 px) |
+| 32–39   | 8 projectile radar | 1 = clear, 0 = bullet at player (150 px) |
+| 40–47   | 8 gold radar       | 1 = no gold, 0 = gold at player (150 px) |
+| 48      | hp fraction        | virtual HP (4 engine units), 0 = dead |
+| 49      | vx normalised      | (−200..+200) → (0..1) |
+| 50      | vy normalised      | positive vy = falling |
+| 51      | on_ground          | 0 or 1 |
+| 52      | jetpack fuel       | 0 = empty, 1 = full |
+| 53      | wand ready         | 0 = on cooldown, 1 = can fire |
+| 54      | is_on_fire         | 0 or 1 |
+| 55      | is_poisoned        | 0 or 1 |
+| 56      | sky_visibility     | 1 = surface, 0 = deep underground (depth proxy) |
 
-## Action space (Discrete 5)
+## Action space (Discrete 8)
+
+Composable move+jump so the agent can hop over corridor ledges. Fire is a
+separate action; action 7 forces aim straight down ("dig").
 
 | Value | Effect |
 |-------|--------|
-| 0 | IDLE — no input |
-| 1 | LEFT — vx = −60 |
-| 2 | RIGHT — vx = +60 |
-| 3 | JUMP — vy = −150 (only when on_ground) |
-| 4 | FIRE — mButtonDownFire = true |
+| 0 | IDLE       — vx target = 0, no jump, no fire |
+| 1 | LEFT       — vx = −60 |
+| 2 | RIGHT      — vx = +60 |
+| 3 | JUMP       — vy = −150 (on ground) / jetpack (in air, vy -= 25) |
+| 4 | LEFT+JUMP  — vx = −60 AND jump/jetpack |
+| 5 | RIGHT+JUMP — vx = +60 AND jump/jetpack |
+| 6 | FIRE       — auto-aim at nearest enemy, fire wand |
+| 7 | FIRE_DOWN  — aim straight down, fire wand (used for digging) |
+
+No smoothing: `mVelocity.x` is set to the target every action tick. This
+tightens credit assignment but means the agent can stop on a dime.
 
 ## Reward function
 
 ```
-+0.01          per step (survival)
-+0.3 × Δdepth  when player reaches a new Y record (Noita Y increases downward)
-−10 × Δhp      proportional to damage taken this step
-−2.0           on death
+−0.001                       time tax (small)
++0.02 × Δmanhattan_from_spawn  when a new max distance from spawn is reached
++0.5                          per newly visited 32×32 chunk (curiosity)
++0.02 × Δdepth_y              small bonus for new depth record
+−1.0 × Δhp                    damage taken this step
++5.0  × Δkills                enemies killed
+−1.0                          on death
+truncate after 600 steps without progress  (no penalty — just ends episode)
 ```
+
+The reward is built around Manhattan distance from the per-episode spawn,
+because the old "+Δdepth only" reward punished horizontal corridors. The
+−10 cowardice penalty has been removed entirely.
 
 ---
 
@@ -125,6 +151,24 @@ python train_multi.py --envs 2 --resume checkpoints/noita_ppo_2env_400000_steps.
 ```
 
 ---
+
+## Tips for future agents working on this codebase
+
+- **`ent_coef = 0.02` is mandatory** in `config.py`. SB3's default `0.0`
+  produces deterministic policies that stop exploring after ~10k steps.
+  Symptom: agent stands still or twitches in spawn area for hours.
+- **The "virtual HP" hack** (`init.lua: IMMORTAL_HP = 10000`, `VIRTUAL_MAX_HP = 4`)
+  keeps Noita's engine from killing the player entity. When `virtual_hp` hits 0
+  we teleport-respawn instead of triggering a real death sequence. This exists
+  because Noita has no level-reset API — we can't reload the seed without
+  restarting the game.
+- **Spawn randomization** uses a `spawn_candidates` pool with `±30 px` X jitter
+  to prevent the policy from overfitting to one corridor entrance.
+- **Action trace log**: every applied action is appended as one JSON line to
+  `actions_trace.jsonl` (5 MB rotation). Useful for verifying that the agent's
+  intended action actually became a `vx/vy` change on the physics tick.
+- **Each game restart re-rolls the world seed.** Long-term curricula must
+  account for this — there is no "save and resume in same level" path.
 
 ## Key Noita API facts (for future agents)
 

@@ -80,6 +80,8 @@ def train(n_envs: int, base_port: int, total_steps: int, resume: str | None):
             verbose=1, learning_rate=cfg.learning_rate, n_steps=cfg.n_steps,
             batch_size=cfg.batch_size, n_epochs=cfg.n_epochs, gamma=cfg.gamma,
             gae_lambda=cfg.gae_lambda, clip_range=cfg.clip_range,
+            ent_coef=cfg.ent_coef, vf_coef=cfg.vf_coef,
+            max_grad_norm=cfg.max_grad_norm,
             tensorboard_log=cfg.tensorboard_dir,
         )
 

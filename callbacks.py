@@ -50,9 +50,11 @@ class NoitaMonitorCallback(BaseCallback):
         self._tg        = notifier
         self._start_ts  = time.time()
         self._last_tg   = 0          # steps at last telegram send
-        self._ep_rewards: deque[float] = deque(maxlen=500)
-        self._ep_depths:  deque[float] = deque(maxlen=500)
-        self._ep_lengths: deque[int]   = deque(maxlen=500)
+        self._ep_rewards:   deque[float] = deque(maxlen=500)
+        self._ep_depths:    deque[float] = deque(maxlen=500)
+        self._ep_lengths:   deque[int]   = deque(maxlen=500)
+        self._ep_chunks:    deque[int]   = deque(maxlen=500)
+        self._ep_distances: deque[float] = deque(maxlen=500)
         self._total_episodes = 0
         self._stop_requested = False
 
@@ -88,22 +90,35 @@ class NoitaMonitorCallback(BaseCallback):
                 continue
             r = float(ep["r"])
             l = int(ep["l"])
+            chunks = int(info.get("noita/visited_chunks", 0))
+            dist   = float(info.get("noita/max_spawn_distance", 0.0))
+            depth  = float(info.get("noita/max_depth", 0.0))
             self._ep_rewards.append(r)
             self._ep_lengths.append(l)
+            self._ep_chunks.append(chunks)
+            self._ep_distances.append(dist)
             self._total_episodes += 1
 
             # Log every episode to loguru
             logger.debug(
-                "ep={} reward={:.2f} length={} steps={}",
-                self._total_episodes, r, l, self.num_timesteps,
+                "ep={} reward={:.2f} length={} chunks={} dist={:.0f} steps={}",
+                self._total_episodes, r, l, chunks, dist, self.num_timesteps,
             )
+
+            # Surface in SB3's "rollout/" namespace for TensorBoard
+            self.logger.record("noita/visited_chunks",     chunks)
+            self.logger.record("noita/max_spawn_distance", dist)
+            self.logger.record("noita/max_depth",          depth)
 
             # W&B per-episode
             if self._cfg.wandb_enabled and _WANDB_OK:
                 wandb.log({
-                    "episode/reward": r,
-                    "episode/length": l,
-                    "episode/total":  self._total_episodes,
+                    "episode/reward":         r,
+                    "episode/length":         l,
+                    "episode/visited_chunks": chunks,
+                    "episode/spawn_distance": dist,
+                    "episode/max_depth":      depth,
+                    "episode/total":          self._total_episodes,
                 }, step=self.num_timesteps)
 
         # Periodic Telegram update
@@ -120,16 +135,20 @@ class NoitaMonitorCallback(BaseCallback):
 
         mean_r = float(np.mean(self._ep_rewards))
         mean_l = float(np.mean(self._ep_lengths))
+        mean_c = float(np.mean(self._ep_chunks))    if self._ep_chunks    else 0.0
+        mean_d = float(np.mean(self._ep_distances)) if self._ep_distances else 0.0
         elapsed = time.time() - self._start_ts
         sps = self.num_timesteps / max(elapsed, 1)
 
         # W&B rollout metrics
         if self._cfg.wandb_enabled and _WANDB_OK:
             wandb.log({
-                "rollout/mean_reward":    mean_r,
-                "rollout/mean_ep_length": mean_l,
-                "rollout/steps_per_sec":  sps,
-                "rollout/episodes":       self._total_episodes,
+                "rollout/mean_reward":          mean_r,
+                "rollout/mean_ep_length":       mean_l,
+                "rollout/mean_visited_chunks":  mean_c,
+                "rollout/mean_spawn_distance":  mean_d,
+                "rollout/steps_per_sec":        sps,
+                "rollout/episodes":             self._total_episodes,
             }, step=self.num_timesteps)
 
         # Rich terminal table every N rollouts
@@ -155,14 +174,18 @@ class NoitaMonitorCallback(BaseCallback):
     def _stats_text(self) -> str:
         elapsed = time.time() - self._start_ts
         pct = self.num_timesteps / max(self._cfg.total_timesteps, 1) * 100
-        mean_r = float(np.mean(self._ep_rewards)) if self._ep_rewards else 0.0
-        mean_l = float(np.mean(self._ep_lengths)) if self._ep_lengths else 0.0
+        mean_r = float(np.mean(self._ep_rewards))   if self._ep_rewards   else 0.0
+        mean_l = float(np.mean(self._ep_lengths))   if self._ep_lengths   else 0.0
+        mean_c = float(np.mean(self._ep_chunks))    if self._ep_chunks    else 0.0
+        mean_d = float(np.mean(self._ep_distances)) if self._ep_distances else 0.0
         sps = self.num_timesteps / max(elapsed, 1)
         return (
             f"Steps: {self.num_timesteps:,} / {self._cfg.total_timesteps:,} ({pct:.1f}%)\n"
             f"Episodes: {self._total_episodes:,}\n"
             f"Mean reward: {mean_r:.2f}\n"
             f"Mean ep length: {mean_l:.0f}\n"
+            f"Mean visited chunks: {mean_c:.1f}\n"
+            f"Mean spawn distance: {mean_d:.0f}\n"
             f"Speed: {sps:.0f} steps/s\n"
             f"Elapsed: {elapsed/3600:.1f} h"
         )
@@ -184,14 +207,18 @@ class NoitaMonitorCallback(BaseCallback):
         )
 
     def _print_table(self, mean_r: float, mean_l: float, sps: float) -> None:
+        mean_c = float(np.mean(self._ep_chunks))    if self._ep_chunks    else 0.0
+        mean_d = float(np.mean(self._ep_distances)) if self._ep_distances else 0.0
         t = Table(title=f"NoitaRL  step {self.num_timesteps:,}", style="dim")
         t.add_column("Metric", style="cyan")
         t.add_column("Value",  style="green")
-        t.add_row("Episodes",        str(self._total_episodes))
-        t.add_row("Mean reward",     f"{mean_r:.3f}")
-        t.add_row("Mean ep length",  f"{mean_l:.0f}")
-        t.add_row("Steps/sec",       f"{sps:.0f}")
-        t.add_row("Elapsed",         f"{(time.time()-self._start_ts)/60:.1f} min")
+        t.add_row("Episodes",            str(self._total_episodes))
+        t.add_row("Mean reward",         f"{mean_r:.3f}")
+        t.add_row("Mean ep length",      f"{mean_l:.0f}")
+        t.add_row("Mean visited chunks", f"{mean_c:.1f}")
+        t.add_row("Mean spawn distance", f"{mean_d:.0f}")
+        t.add_row("Steps/sec",           f"{sps:.0f}")
+        t.add_row("Elapsed",             f"{(time.time()-self._start_ts)/60:.1f} min")
         console.print(t)
 
     # ── Telegram commands ─────────────────────────────────────────────────────

@@ -17,7 +17,9 @@ Observation (57 float32, all in [0, 1]):
   [55]       is_poisoned    (0 or 1)
   [56]       sky_visibility (1=surface, 0=deep underground)
 
-Actions (Discrete 5):  0=idle  1=left  2=right  3=jump  4=fire
+Actions (Discrete 8):
+  0=idle  1=left  2=right  3=jump
+  4=left+jump  5=right+jump  6=fire(auto-aim)  7=fire-down(dig)
 """
 
 from __future__ import annotations
@@ -44,7 +46,7 @@ class NoitaEnv(gym.Env):
         self.host = host
         self.port = port
 
-        self.action_space = gym.spaces.Discrete(5)
+        self.action_space = gym.spaces.Discrete(8)
         self.observation_space = gym.spaces.Box(
             low=0.0, high=1.0, shape=(57,), dtype=np.float32
         )
@@ -56,14 +58,19 @@ class NoitaEnv(gym.Env):
         self._loop:  Optional[asyncio.AbstractEventLoop] = None
 
         # Episode stats
-        self.episode_num    = 0
-        self.episode_steps  = 0
-        self.episode_reward = 0.0
-        self.last_hp        = 1.0
-        self.last_x         = 0.0
-        self.max_depth_y    = 0.0
-        self.last_gold      = 0
-        self.last_kills     = 0
+        self.episode_num         = 0
+        self.episode_steps       = 0
+        self.episode_reward      = 0.0
+        self.last_hp             = 1.0
+        self.last_x              = 0.0
+        self.max_depth_y         = 0.0
+        self.last_gold           = 0
+        self.last_kills          = 0
+        self.spawn_x             = 0.0
+        self.spawn_y             = 0.0
+        self.max_spawn_distance  = 0.0
+        self.steps_without_progress = 0
+        self.visited_chunks: set = set()
 
         self._start_server()
         logger.info("[env:{}] WebSocket server on {}:{}", port, host, port)
@@ -189,21 +196,18 @@ class NoitaEnv(gym.Env):
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
-        self.episode_num    += 1
-        self.episode_steps   = 0
-        self.episode_reward  = 0.0
-        self.last_hp         = 1.0
-        self.max_depth_y     = 0.0
-        self.last_gold       = 0
-        self.last_kills      = 0
-        self.visited_chunks: set = set()
+        self.episode_num            += 1
+        self.episode_steps           = 0
+        self.episode_reward          = 0.0
+        self.last_hp                 = 1.0
+        self.max_depth_y             = 0.0
+        self.last_gold               = 0
+        self.last_kills              = 0
+        self.max_spawn_distance      = 0.0
+        self.steps_without_progress  = 0
+        self.visited_chunks          = set()
 
         logger.debug("[env:{}] reset() — episode {}", self.port, self.episode_num)
-
-        # Tell Lua to teleport back to spawn (handles both normal death and step-limit timeout)
-        self._send_action(99)
-        with self._lock:
-            self._state = None   # discard stale state; wait for fresh one after respawn
 
         if not self._wait_for_live_state(timeout=60.0):
             logger.error("[env:{}] reset() timed out — is Noita running?", self.port)
@@ -213,6 +217,8 @@ class NoitaEnv(gym.Env):
             self.last_hp     = s.get("hp", 1.0)
             self.max_depth_y = s.get("y", 0.0)
             self.last_x      = s.get("x", 0.0)
+            self.spawn_x     = s.get("x", 0.0)
+            self.spawn_y     = s.get("y", 0.0)
             self.last_gold   = s.get("gold",  0)
             self.last_kills  = s.get("kills", 0)
 
@@ -248,68 +254,74 @@ class NoitaEnv(gym.Env):
         dead       = state.get("dead", False)
 
         # ── Reward ────────────────────────────────────────────────────────────
-        # Time tax: стоять невыгодно.
-        reward = -0.005
+        # Design goal: reward ANY movement away from spawn, not just descent.
+        # The old code only rewarded +Δy and punished standing still with -10,
+        # which killed the agent for walking down a horizontal corridor.
+        reward = -0.001  # very small time tax (was -0.005)
 
-        # Curiosity: первое посещение чанка 64×64 пикселя.
-        chunk = (int(current_x // 64), int(current_y // 64))
+        # 1. Manhattan progress from spawn (rewards lateral movement too)
+        dist = abs(current_x - self.spawn_x) + abs(current_y - self.spawn_y)
+        if dist > self.max_spawn_distance:
+            reward += (dist - self.max_spawn_distance) * 0.02
+            self.max_spawn_distance = dist
+            self.steps_without_progress = 0
+        else:
+            self.steps_without_progress += 1
+
+        # 2. Strong curiosity bonus for new 32×32 chunks
+        chunk = (int(current_x // 32), int(current_y // 32))
         if chunk not in self.visited_chunks:
             self.visited_chunks.add(chunk)
-            reward += 0.05
+            reward += 0.5
 
-        # Новая максимальная глубина.
+        # 3. Small additional bonus for new depth records (preserves "go down")
         if current_y > self.max_depth_y:
-            reward += (current_y - self.max_depth_y) * 0.5
+            reward += (current_y - self.max_depth_y) * 0.02
             self.max_depth_y = current_y
 
-        # Штраф за урон.
+        # 4. Soft truncation when no progress for ~40s real time (no penalty —
+        # truncated episodes don't bootstrap to V(s)=0 in SB3, unlike terminal).
+        truncated = False
+        if self.steps_without_progress > 600:
+            logger.info("[env:{}] Ep truncated (no progress for 600 steps).", self.port)
+            truncated = True
+
+        # 5. Damage / kills (kept, milder)
         if current_hp < self.last_hp:
-            reward -= (self.last_hp - current_hp) * 3.0
+            reward -= (self.last_hp - current_hp) * 1.0
 
-        # Награда за сбор золота.
-        current_gold = state.get("gold", 0)
-        if current_gold > self.last_gold:
-            reward += (current_gold - self.last_gold) * 0.001
-        self.last_gold = current_gold
-
-        # Награда за убийства.
         current_kills = state.get("kills", 0)
         if current_kills > self.last_kills:
-            reward += (current_kills - self.last_kills) * 10.0
+            reward += (current_kills - self.last_kills) * 5.0
         self.last_kills = current_kills
 
-        # Reward shaping: поощряем стрельбу по врагу, штрафуем стрельбу в пустоту.
-        if action == 4:
-            enemy_radar = state.get("enemy_radar", [1.0] * 8)
-            if any(v < 1.0 for v in enemy_radar):
-                reward += 0.05   # враг виден — молодец, стреляешь
-            else:
-                reward -= 0.02   # стреляешь в пустоту — штраф
-
-        # Лимит шагов: 4000 шагов × FRAME_SKIP 4 = 16 000 кадров ≈ 4.5 мин.
-        # Если бот дожил — он нашёл безопасную нору и тупит. Штраф + принудительный конец.
-        if self.episode_steps >= 4000:
-            dead = True
-            reward -= 5.0
-
-        # Штраф за смерть.
-        if dead:
+        # 6. Death penalty — mild so the agent doesn't become risk-averse
+        if dead and current_hp <= 0:
             reward -= 1.0
 
         self.last_hp         = current_hp
         self.episode_steps  += 1
         self.episode_reward += reward
 
-        if dead:
+        if dead or truncated:
             logger.info(
-                "[env:{}] Ep {:3d} done — steps={} reward={:.2f} max_depth={:.0f}",
+                "[env:{}] Ep {:3d} done — steps={} reward={:.2f} "
+                "max_dist={:.0f} max_depth={:.0f} chunks={} ({})",
                 self.port, self.episode_num, self.episode_steps,
-                self.episode_reward, self.max_depth_y,
+                self.episode_reward, self.max_spawn_distance,
+                self.max_depth_y, len(self.visited_chunks),
+                "TRUNC" if truncated and not dead else "DEAD",
             )
-            info = {"episode": {"r": self.episode_reward, "l": self.episode_steps}}
+            info = {
+                "episode": {"r": self.episode_reward, "l": self.episode_steps},
+                "noita/visited_chunks":     len(self.visited_chunks),
+                "noita/max_spawn_distance": float(self.max_spawn_distance),
+                "noita/max_depth":          float(self.max_depth_y),
+            }
             with self._lock:
                 self._state = None   # force reset() to wait for fresh state
-            return self._obs_from_state(state), reward, True, False, info
+            terminated = bool(dead) and not truncated
+            return self._obs_from_state(state), reward, terminated, truncated, info
 
         return self._obs_from_state(state), reward, False, False, {}
 

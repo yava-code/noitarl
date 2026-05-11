@@ -31,7 +31,7 @@ local function err(m)   log("ERROR", m) end
 
 -- Clear log on each start so it doesn't grow forever
 do local f = io.open(LOG_FILE, "w"); if f then f:close() end end
-info("Mod init started — noitarl v0.2")
+info("Mod init started — noitarl v0.3 (Discrete 8, no smoothing)")
 
 -- ── Safe component accessors ──────────────────────────────────────────────
 -- Noita's ComponentGetValue2 / ComponentSetValue2 silently crash if the
@@ -78,7 +78,10 @@ local gui                       = nil
 -- ── Movement constants ────────────────────────────────────────────────────
 local MOVE_SPEED     = 60
 local JUMP_SPEED     = -150
-local FRAME_SKIP     = 4     -- accept new action / send state every N frames
+local JETPACK_THRUST = 25     -- per-frame vy delta while jetpack active (was 12)
+local JETPACK_DRAIN  = 20
+local JETPACK_VY_CAP = -250
+local FRAME_SKIP     = 4      -- accept new action / send state every N frames
 
 -- Immortal-agent HP hack: engine never kills the player;
 -- we track "virtual HP" ourselves and teleport-respawn when it hits 0.
@@ -87,75 +90,124 @@ local VIRTUAL_MAX_HP = 4.0    -- 4.0 engine units ≈ 100% HP in UI
 local virtual_hp     = VIRTUAL_MAX_HP
 
 -- ── Per-frame state ───────────────────────────────────────────────────────
+-- Discrete 8 action space (jump+move composable, fire+aim_down for digging)
+--   0 IDLE | 1 LEFT | 2 RIGHT | 3 JUMP | 4 L+JUMP | 5 R+JUMP | 6 FIRE | 7 FIRE_DOWN
 local pending_action  = 0
 local last_action     = 0
-local ACTION_NAMES    = {[0]="IDLE",[1]="LEFT",[2]="RIGHT",[3]="JUMP",[4]="FIRE"}
-local FORCE_RESPAWN   = 99   -- special signal from Python to force episode reset
+local ACTION_NAMES    = {
+    [0]="IDLE", [1]="LEFT", [2]="RIGHT", [3]="JUMP",
+    [4]="L+JMP", [5]="R+JMP", [6]="FIRE", [7]="DIG_D",
+}
+-- Movement decomposition for each action: {move_x, do_jump, do_fire, aim_down}
+local ACTION_DECODE = {
+    [0]={ 0, false, false, false },
+    [1]={-1, false, false, false },
+    [2]={ 1, false, false, false },
+    [3]={ 0, true,  false, false },
+    [4]={-1, true,  false, false },
+    [5]={ 1, true,  false, false },
+    [6]={ 0, false, true,  false },
+    [7]={ 0, false, true,  true  },
+}
+local MAX_EP_STEPS    = 4000  -- ~4.5 min at 60 fps with FRAME_SKIP=4
 
 -- ── Episode tracking ──────────────────────────────────────────────────────
-local spawn_x, spawn_y = 400.0, 50.0  -- entrance to the first mines
-local episode_num      = 0
-local episode_steps    = 0
-local frame_times      = {}   -- rolling window for FPS estimate
-local PERF_WINDOW      = 60
+-- spawn_candidates accumulates good "anchor" positions; respawn picks one at random
+local spawn_x, spawn_y      = nil, nil   -- recorded on first frame
+local spawn_candidates      = {}         -- list of {x=, y=}
+local SPAWN_JITTER          = 30
+local episode_num           = 0
+local episode_steps         = 0
+local frame_times           = {}   -- rolling window for FPS estimate
+local PERF_WINDOW           = 60
 
--- ── Apply action: smoothed velocity + manual jetpack ─────────────────────
+-- Action trace log (one line per applied action) for offline debugging
+local LOG_FILE_ACTIONS      = mod_path("actions_trace.jsonl")
+local ACTION_LOG_ROTATE_AT  = 5 * 1024 * 1024   -- 5 MB
+local action_log_size       = 0
+do local f = io.open(LOG_FILE_ACTIONS, "w"); if f then f:close() end end
+
+-- ── Action trace logger (offline debugging) ──────────────────────────────
+local function log_action_trace(rec)
+    local ok, line = pcall(json.encode, rec)
+    if not ok then return end
+    local f = io.open(LOG_FILE_ACTIONS, "a")
+    if not f then return end
+    f:write(line, "\n")
+    f:close()
+    action_log_size = action_log_size + #line + 1
+    if action_log_size > ACTION_LOG_ROTATE_AT then
+        local g = io.open(LOG_FILE_ACTIONS, "w"); if g then g:close() end
+        action_log_size = 0
+    end
+end
+
+-- ── Apply action: direct velocity injection, composable move+jump+fire ──
+-- No smoothing — grip is effectively 1.0 so the next physics tick sees the
+-- intended target velocity. This tightens credit assignment for PPO.
 local function apply_action(player, action)
     if not player or player == 0 then return end
-
-    -- Special signal: Python ended the episode via step-limit; teleport back to spawn
-    if action == FORCE_RESPAWN then
-        respawn_player(player)
-        pending_action = 0
-        return
-    end
-
     last_action = action
 
+    local decode = ACTION_DECODE[action] or ACTION_DECODE[0]
+    local move_x, do_jump, do_fire, aim_down =
+        decode[1], decode[2], decode[3], decode[4]
+
+    -- Physics: write velocity directly (mVelocity bypasses Noita's input layer)
+    local vx_out, vy_out, on_ground_now = 0, 0, false
     local cdata = EntityGetFirstComponent(player, "CharacterDataComponent")
     if cdata then
-        local vx, vy    = cget(cdata, "mVelocity")
-        local on_ground = cget(cdata, "is_on_ground")
-        local fuel      = cget(cdata, "mFlyingTimeLeft") or 1000
-        vx = vx or 0; vy = vy or 0
+        local cur_vx, cur_vy = cget(cdata, "mVelocity")
+        local on_ground      = cget(cdata, "is_on_ground")
+        local fuel           = cget(cdata, "mFlyingTimeLeft") or 1000
+        cur_vx = cur_vx or 0; cur_vy = cur_vy or 0
+        on_ground_now = on_ground == true
 
-        -- Horizontal: lerp toward target — ground has more grip than air
-        local target_vx = 0
-        if     action == 1 then target_vx = -MOVE_SPEED
-        elseif action == 2 then target_vx =  MOVE_SPEED
-        end
-        local grip = on_ground and 0.3 or 0.05
-        vx = vx + (target_vx - vx) * grip
+        -- Horizontal: set target directly (no lerp). When the agent says "go
+        -- right", it goes right on the very next physics tick.
+        local target_vx = move_x * MOVE_SPEED
+        local new_vx    = target_vx
 
-        -- Jump / jetpack
-        if action == 3 then
-            if on_ground then
-                vy = JUMP_SPEED
+        -- Vertical: keep current vy, modify on jump/jetpack
+        local new_vy = cur_vy
+        if do_jump then
+            if on_ground_now then
+                new_vy = JUMP_SPEED
             elseif fuel > 0 then
-                vy   = math.max(vy - 12, -200)
-                fuel = math.max(0, fuel - 20)
+                new_vy = math.max(cur_vy - JETPACK_THRUST, JETPACK_VY_CAP)
+                fuel   = math.max(0, fuel - JETPACK_DRAIN)
             end
         end
 
         cset(cdata, "mFlyingTimeLeft", fuel)
-        cset(cdata, "mVelocity", vx, vy)
+        cset(cdata, "mVelocity", new_vx, new_vy)
+        vx_out, vy_out = new_vx, new_vy
     end
 
-    -- Fire + auto-aim on ControlsComponent
+    -- Aiming + firing on ControlsComponent
     local ctrl = EntityGetFirstComponent(player, "ControlsComponent")
     if ctrl then
-        -- Auto-aim: track nearest enemy every frame
         local tok, px, py = pcall(EntityGetTransform, player)
         if tok then
-            local aok, enemies = pcall(EntityGetInRadiusWithTag, px, py, 250, "enemy")
-            local nx, ny = px + 50, py   -- default: face right
-            if aok and enemies and #enemies > 0 then
-                local nearest_d2 = math.huge
-                for _, eid in ipairs(enemies) do
-                    local eok, ex, ey = pcall(EntityGetTransform, eid)
-                    if eok then
-                        local d2 = (ex-px)^2 + ((ey+4)-py)^2
-                        if d2 < nearest_d2 then nearest_d2, nx, ny = d2, ex, ey+4 end
+            local nx, ny
+            if aim_down then
+                -- Override: dig straight down (used by action 7 FIRE_DOWN)
+                nx, ny = px, py + 50
+            else
+                -- Auto-aim: nearest enemy in 250 px, else face current movement
+                local aok, enemies = pcall(EntityGetInRadiusWithTag, px, py, 250, "enemy")
+                local face_x       = (move_x ~= 0) and move_x or 1
+                nx, ny = px + 50 * face_x, py
+                if aok and enemies and #enemies > 0 then
+                    local nearest_d2 = math.huge
+                    for _, eid in ipairs(enemies) do
+                        local eok, ex, ey = pcall(EntityGetTransform, eid)
+                        if eok then
+                            local d2 = (ex - px)^2 + ((ey + 4) - py)^2
+                            if d2 < nearest_d2 then
+                                nearest_d2, nx, ny = d2, ex, ey + 4
+                            end
+                        end
                     end
                 end
             end
@@ -163,34 +215,50 @@ local function apply_action(player, action)
             local len = math.sqrt(dx*dx + dy*dy)
             if len > 0.001 then
                 cset(ctrl, "mAimingVectorNormalized", dx/len, dy/len)
-                cset(ctrl, "mMousePosition", nx, ny)   -- vec2 field, two floats
+                cset(ctrl, "mMousePosition", nx, ny)
             end
         end
 
-        -- Fire: only update mButtonFrameFire on the rising edge so cast_delay isn't
-        -- reset every frame (which would prevent any projectile from actually launching).
-        local fire     = (action == 4)
+        -- Fire: rising-edge frame stamp so cast_delay isn't reset every frame
         local was_fire = (cget(ctrl, "mButtonDownFire") == true)
-
-        cset(ctrl, "mButtonDownFire",      fire)
-        cset(ctrl, "mButtonDownLeftClick", fire)
-
-        if fire and not was_fire then
+        cset(ctrl, "mButtonDownFire",      do_fire)
+        cset(ctrl, "mButtonDownLeftClick", do_fire)
+        if do_fire and not was_fire then
             local frame = GameGetFrameNum()
             cset(ctrl, "mButtonFrameFire",      frame)
             cset(ctrl, "mButtonFrameLeftClick", frame)
         end
     end
+
+    -- Trace one record per applied action for offline analysis
+    if cdata then
+        log_action_trace({
+            f  = GameGetFrameNum(),
+            a  = action,
+            mx = move_x, jp = do_jump and 1 or 0,
+            fr = do_fire and 1 or 0, ad = aim_down and 1 or 0,
+            vx = vx_out, vy = vy_out, gnd = on_ground_now and 1 or 0,
+        })
+    end
 end
 
--- ── Respawn: teleport to spawn, reset virtual HP, flush status effects ───
+-- ── Respawn: teleport to (possibly randomised) spawn, reset state ────────
+local function pick_spawn()
+    -- Choose one of the recorded anchor positions and jitter it slightly so
+    -- the agent doesn't overfit to a single corridor entrance.
+    local n = #spawn_candidates
+    if n == 0 then return spawn_x or 0.0, spawn_y or 0.0 end
+    local sp = spawn_candidates[math.random(n)]
+    local jx = math.random(-SPAWN_JITTER, SPAWN_JITTER)
+    return sp.x + jx, sp.y
+end
+
 local function respawn_player(player)
     virtual_hp = VIRTUAL_MAX_HP
 
-    if spawn_x and spawn_y then
-        local ok, e = pcall(EntitySetTransform, player, spawn_x, spawn_y)
-        if not ok then warn("EntitySetTransform failed: " .. tostring(e)) end
-    end
+    local sx, sy = pick_spawn()
+    local ok, e  = pcall(EntitySetTransform, player, sx, sy)
+    if not ok then warn("EntitySetTransform failed: " .. tostring(e)) end
 
     local cdata = EntityGetFirstComponent(player, "CharacterDataComponent")
     if cdata then
@@ -208,7 +276,8 @@ local function respawn_player(player)
     episode_num    = episode_num + 1
     episode_steps  = 0
     pending_action = 0
-    info(string.format("Ep %d started — spawn (%.0f, %.0f)", episode_num, spawn_x or 0, spawn_y or 0))
+    info(string.format("Ep %d started — spawn (%.0f, %.0f) [pool=%d]",
+        episode_num, sx, sy, #spawn_candidates))
 end
 
 -- ── Mini radar HUD (9 GuiText calls, zero world-space cost) ──────────────
@@ -498,6 +567,7 @@ function OnWorldPostUpdate()
 
     if not spawn_x then
         spawn_x, spawn_y = x, y
+        spawn_candidates[#spawn_candidates + 1] = { x = x, y = y }
         episode_num = 1
         info(string.format("Spawn recorded (%.0f, %.0f)", x, y))
     end
@@ -563,10 +633,11 @@ function OnWorldPostUpdate()
             tostring(on_ground), ACTION_NAMES[last_action] or "?", fps))
     end
 
-    -- Death detection (virtual HP exhausted) ─────────────────────────────
-    if virtual_hp <= 0.0 then
-        info(string.format("Ep %d ended  steps=%d  pos=(%.0f,%.0f)  vhp=%.3f",
-            episode_num, episode_steps, x, y, virtual_hp))
+    -- Death detection: virtual HP exhausted OR episode timeout ──────────────
+    if virtual_hp <= 0.0 or episode_steps >= MAX_EP_STEPS then
+        local reason = (virtual_hp <= 0.0) and "DEAD" or "TIMEOUT"
+        info(string.format("Ep %d ended  steps=%d  reason=%s  pos=(%.0f,%.0f)  vhp=%.3f",
+            episode_num, episode_steps, reason, x, y, virtual_hp))
         local dead_state = {
             x=x, y=y, hp=0.0, vx=0.0, vy=0.0,
             rays=rays, liquid_sensors=liquid_sensors, enemy_radar=enemy_radar,
