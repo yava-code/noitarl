@@ -143,8 +143,9 @@ class NoitaMonitorCallback(BaseCallback):
             depth  = float(info.get("noita/max_depth", 0.0))
 
             max_x = float(info.get("noita/max_x", 0.0))
-            kills = int(info.get("noita/kills", 0))
-            total_damage = float(info.get("noita/total_damage", 0.0))
+            kills         = int(info.get("noita/kills", 0))
+            chests_opened = int(info.get("noita/chests_opened", 0))
+            total_damage  = float(info.get("noita/total_damage", 0.0))
             run_time = float(info.get("noita/run_time_s", 0.0))
             death_reason = info.get("noita/death_reason", "UNKNOWN")
             
@@ -259,6 +260,7 @@ class NoitaMonitorCallback(BaseCallback):
             self.logger.record("noita/max_depth",          depth)
             self.logger.record("noita/max_x",              max_x)
             self.logger.record("noita/kills",              kills)
+            self.logger.record("noita/chests_opened",      chests_opened)
             self.logger.record("noita/total_damage",       total_damage)
 
             # W&B per-episode

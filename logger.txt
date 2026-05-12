@@ -4235,3 +4235,79 @@
 [19:48:20] [INFO ] DIAG ep=140 step=646 pos=(296,-221) vel=(0.0,22.8) vhp=4.00 gnd=false act=JETPK fps=58
 [19:48:25] [INFO ] DIAG ep=140 step=721 pos=(302,-322) vel=(0.0,156.2) vhp=4.00 gnd=false act=JUMP fps=60
 [19:48:30] [INFO ] DIAG ep=140 step=796 pos=(359,-130) vel=(51.0,86.5) vhp=4.00 gnd=false act=R+JMP fps=59
+[19:48:35] [INFO ] DIAG ep=140 step=871 pos=(586,-122) vel=(51.0,1.7) vhp=4.00 gnd=false act=R+JMP fps=60
+[19:48:41] [INFO ] DIAG ep=140 step=946 pos=(715,-88) vel=(0.0,60.0) vhp=4.00 gnd=true act=IDLE fps=60
+[19:48:46] [INFO ] DIAG ep=140 step=1021 pos=(868,-89) vel=(51.0,-15.8) vhp=4.00 gnd=false act=R+JMP fps=60
+[19:48:51] [INFO ] DIAG ep=140 step=1096 pos=(1079,164) vel=(51.0,40.8) vhp=4.00 gnd=false act=R+JMP fps=60
+[19:48:56] [INFO ] DIAG ep=140 step=1171 pos=(1204,308) vel=(0.0,193.7) vhp=4.00 gnd=false act=IDLE fps=60
+[19:49:01] [INFO ] DIAG ep=140 step=1246 pos=(1201,336) vel=(0.0,0.0) vhp=4.00 gnd=false act=L+JMP fps=60
+[19:49:06] [INFO ] DIAG ep=140 step=1321 pos=(1194,329) vel=(0.0,151.7) vhp=4.00 gnd=true act=JUMP fps=60
+[19:49:11] [INFO ] DIAG ep=140 step=1396 pos=(1181,283) vel=(0.0,-99.3) vhp=4.00 gnd=false act=JETPK fps=60
+[19:49:17] [INFO ] DIAG ep=140 step=1471 pos=(1202,319) vel=(0.0,12.1) vhp=4.00 gnd=false act=JUMP fps=60
+[19:49:22] [INFO ] DIAG ep=140 step=1546 pos=(1213,235) vel=(51.0,99.2) vhp=4.00 gnd=false act=R+JMP fps=60
+[19:49:27] [INFO ] DIAG ep=140 step=1621 pos=(1211,371) vel=(0.0,-12.9) vhp=4.00 gnd=false act=FIRE fps=60
+[19:49:32] [INFO ] DIAG ep=140 step=1696 pos=(1202,349) vel=(43.6,7.0) vhp=4.00 gnd=false act=R+JMP fps=60
+[19:49:38] [INFO ] DIAG ep=140 step=1771 pos=(1196,317) vel=(0.0,40.6) vhp=1.80 gnd=false act=KICK fps=41
+[19:49:43] [INFO ] DIAG ep=140 step=1846 pos=(1207,380) vel=(0.0,28.3) vhp=1.80 gnd=false act=JUMP fps=60
+[19:49:49] [INFO ] DIAG ep=140 step=1921 pos=(1201,324) vel=(0.0,-29.7) vhp=1.80 gnd=false act=DIG_D fps=60
+[19:49:54] [INFO ] DIAG ep=140 step=1996 pos=(1201,349) vel=(0.0,-2.4) vhp=1.80 gnd=false act=DIG_D fps=60
+[19:49:59] [INFO ] DIAG ep=140 step=2071 pos=(1194,343) vel=(0.0,-127.5) vhp=1.80 gnd=false act=FIRE fps=60
+[19:50:04] [INFO ] DIAG ep=140 step=2146 pos=(1187,321) vel=(43.6,20.7) vhp=1.80 gnd=false act=R+JMP fps=60
+[19:50:09] [INFO ] DIAG ep=140 step=2221 pos=(1199,346) vel=(-43.6,-14.0) vhp=1.80 gnd=false act=L+JMP fps=60
+[19:50:14] [INFO ] DIAG ep=140 step=2296 pos=(1219,342) vel=(0.0,146.7) vhp=1.80 gnd=false act=JUMP fps=60
+[19:50:19] [INFO ] DIAG ep=140 step=2371 pos=(1188,313) vel=(0.0,47.4) vhp=1.80 gnd=false act=IDLE fps=59
+[19:50:24] [INFO ] DIAG ep=140 step=2446 pos=(1194,359) vel=(0.0,-38.2) vhp=1.80 gnd=false act=L+JMP fps=60
+[19:50:30] [INFO ] DIAG ep=140 step=2521 pos=(1192,314) vel=(51.0,-18.1) vhp=1.80 gnd=false act=RIGHT fps=58
+[19:50:35] [INFO ] DIAG ep=140 step=2596 pos=(1193,347) vel=(43.6,5.0) vhp=1.80 gnd=false act=R+JMP fps=59
+[19:50:41] [INFO ] DIAG ep=140 step=2671 pos=(1207,324) vel=(43.6,143.7) vhp=1.80 gnd=false act=R+JMP fps=37
+[19:50:46] [INFO ] DIAG ep=140 step=2746 pos=(1186,324) vel=(-43.6,11.5) vhp=1.80 gnd=false act=L+JMP fps=60
+[19:50:51] [INFO ] DIAG ep=140 step=2821 pos=(1198,348) vel=(43.6,14.2) vhp=1.80 gnd=false act=R+JMP fps=60
+[19:50:57] [INFO ] DIAG ep=140 step=2896 pos=(1186,244) vel=(0.0,-48.7) vhp=1.80 gnd=false act=JETPK fps=36
+[19:51:03] [INFO ] DIAG ep=140 step=2971 pos=(1193,319) vel=(43.6,-4.7) vhp=1.80 gnd=false act=RIGHT fps=60
+[19:51:08] [INFO ] DIAG ep=140 step=3046 pos=(1198,342) vel=(-51.0,4.7) vhp=1.80 gnd=false act=LEFT fps=60
+[19:51:13] [INFO ] DIAG ep=140 step=3121 pos=(1215,264) vel=(51.0,96.8) vhp=1.80 gnd=false act=R+JMP fps=60
+[19:51:19] [INFO ] DIAG ep=140 step=3196 pos=(1185,295) vel=(0.0,-33.0) vhp=1.80 gnd=false act=KICK fps=59
+[19:51:24] [INFO ] DIAG ep=140 step=3271 pos=(1197,342) vel=(-51.0,10.6) vhp=1.80 gnd=false act=LEFT fps=60
+[19:51:29] [INFO ] DIAG ep=140 step=3346 pos=(1187,324) vel=(43.6,-3.6) vhp=1.80 gnd=false act=R+JMP fps=60
+[19:51:34] [INFO ] DIAG ep=140 step=3421 pos=(1194,343) vel=(-43.6,-21.5) vhp=1.80 gnd=false act=L+JMP fps=60
+[19:51:39] [INFO ] DIAG ep=140 step=3496 pos=(1188,320) vel=(-43.6,-3.0) vhp=1.80 gnd=false act=LEFT fps=60
+[19:51:48] [INFO ] DIAG ep=140 step=3571 pos=(1247,378) vel=(0.0,0.0) vhp=1.80 gnd=false act=R+JMP fps=47
+[19:51:54] [INFO ] DIAG ep=140 step=3646 pos=(1192,264) vel=(-51.0,-91.0) vhp=1.80 gnd=false act=LEFT fps=48
+[19:51:59] [WARN ] Socket error #1 — will reconnect
+[19:51:59] [INFO ] Connecting → ws://localhost:5001
+[19:52:03] [WARN ] Socket error #1 — will reconnect
+[19:52:03] [INFO ] Connecting → ws://localhost:5001
+[19:52:07] [WARN ] Socket error #1 — will reconnect
+[19:52:07] [INFO ] Connecting → ws://localhost:5001
+[19:52:11] [WARN ] Socket error #1 — will reconnect
+[19:52:11] [INFO ] Connecting → ws://localhost:5001
+[19:52:15] [WARN ] Socket error #1 — will reconnect
+[19:52:15] [INFO ] Connecting → ws://localhost:5001
+[19:52:19] [WARN ] Socket error #1 — will reconnect
+[19:52:19] [INFO ] Connecting → ws://localhost:5001
+[19:52:24] [WARN ] Socket error #1 — will reconnect
+[19:52:24] [INFO ] Connecting → ws://localhost:5001
+[19:52:28] [WARN ] Socket error #1 — will reconnect
+[19:52:28] [INFO ] Connecting → ws://localhost:5001
+[19:52:32] [WARN ] Socket error #1 — will reconnect
+[19:52:32] [INFO ] Connecting → ws://localhost:5001
+[19:52:36] [WARN ] Socket error #1 — will reconnect
+[19:52:36] [INFO ] Connecting → ws://localhost:5001
+[19:52:40] [WARN ] Socket error #1 — will reconnect
+[19:52:40] [INFO ] Connecting → ws://localhost:5001
+[19:52:44] [WARN ] Socket error #1 — will reconnect
+[19:52:44] [INFO ] Connecting → ws://localhost:5001
+[19:52:48] [WARN ] Socket error #1 — will reconnect
+[19:52:48] [INFO ] Connecting → ws://localhost:5001
+[19:52:52] [WARN ] Socket error #1 — will reconnect
+[19:52:52] [INFO ] Connecting → ws://localhost:5001
+[19:52:56] [WARN ] Socket error #1 — will reconnect
+[19:52:56] [INFO ] Connecting → ws://localhost:5001
+[19:53:00] [WARN ] Socket error #1 — will reconnect
+[19:53:01] [INFO ] Connecting → ws://localhost:5001
+[19:53:05] [WARN ] Socket error #1 — will reconnect
+[19:53:05] [INFO ] Connecting → ws://localhost:5001
+[19:53:09] [WARN ] Socket error #1 — will reconnect
+[19:53:09] [INFO ] Connecting → ws://localhost:5001
+[19:53:13] [WARN ] Socket error #1 — will reconnect
+[19:53:13] [INFO ] Connecting → ws://localhost:5001

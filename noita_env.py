@@ -75,6 +75,7 @@ class NoitaEnv(gym.Env):
         self.max_depth_y         = 0.0
         self.last_gold           = 0
         self.last_kills          = 0
+        self.last_chests         = 0
         self.spawn_x             = 0.0
         self.spawn_y             = 0.0
         self.max_spawn_distance  = 0.0
@@ -222,6 +223,7 @@ class NoitaEnv(gym.Env):
         self.max_depth_y             = 0.0
         self.last_gold               = 0
         self.last_kills              = 0
+        self.last_chests             = 0
         self.max_spawn_distance      = 0.0
         self.max_x                   = 0.0
         self.total_damage            = 0.0
@@ -245,8 +247,9 @@ class NoitaEnv(gym.Env):
             self.spawn_x     = s.get("x", 0.0)
             self.spawn_y     = s.get("y", 0.0)
             self.max_x       = self.spawn_x
-            self.last_gold   = s.get("gold",  0)
-            self.last_kills  = s.get("kills", 0)
+            self.last_gold   = s.get("gold",   0)
+            self.last_kills  = s.get("kills",  0)
+            self.last_chests = s.get("chests", 0)
 
         return self._obs_from_state(s), {}
 
@@ -369,6 +372,12 @@ class NoitaEnv(gym.Env):
         if current_kills > self.last_kills:
             reward += (current_kills - self.last_kills) * 5.0
         self.last_kills = current_kills
+
+        # Chest opened by Lua auto-open (agent was close enough → EntityKill)
+        current_chests = state.get("chests", 0)
+        if current_chests > self.last_chests:
+            reward += (current_chests - self.last_chests) * 3.0
+        self.last_chests = current_chests
 
         # 5b. Aim-on-enemy bonus: small reward when FIRE pressed AND an enemy is in
         # 250 px. Closes the gap between "I pulled the trigger" and the rare +5/kill.
@@ -509,6 +518,7 @@ class NoitaEnv(gym.Env):
                 "noita/max_depth":          float(self.max_depth_y),
                 "noita/max_x":              float(self.max_x),
                 "noita/kills":              int(self.last_kills),
+                "noita/chests_opened":      int(self.last_chests),
                 "noita/total_damage":       float(self.total_damage),
                 "noita/run_time_s":         float(run_time),
                 "noita/steps_without_progress": int(self.steps_without_progress),

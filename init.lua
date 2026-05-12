@@ -84,6 +84,7 @@ local JETPACK_FUEL_BURN = 8   -- mFlyingTimeLeft units burned per tick
 local KICK_RANGE     = 30     -- px from player to count enemies for KICK
 local KICK_DAMAGE    = 0.5    -- engine HP units (≈ 12% of player max)
 local KICK_COOLDOWN  = 15     -- frames between KICK actions to prevent DPS-spam
+local CHEST_RANGE    = 22     -- px: if any chest centre is within this radius → auto-open
 local FRAME_SKIP     = 4      -- Process action/state every 4 frames (trade-off: reduces CPU overhead while keeping fast 15 FPS reactions)
 
 -- Bare JUMP (action 3/4/5) still requires on_ground; only the explicit JETPACK_HOLD
@@ -107,6 +108,10 @@ local initial_descent_done   = false
 local IMMORTAL_HP    = 10000.0
 local VIRTUAL_MAX_HP = 4.0    -- 4.0 engine units ≈ 100% HP in UI
 local virtual_hp     = VIRTUAL_MAX_HP
+
+-- ── Chest session counters ────────────────────────────────────────────────
+local chests_opened_total = 0    -- across all episodes this session
+local chests_opened_ep    = 0    -- reset each episode
 
 -- ── Per-frame state ───────────────────────────────────────────────────────
 -- Discrete 10 action space:
@@ -352,9 +357,10 @@ local function respawn_player(player)
     local water_id = CellFactory_GetType("water")
     pcall(EntityAddRandomStains, player, water_id, 400)
 
-    episode_num    = episode_num + 1
-    episode_steps  = 0
-    pending_action = 0
+    episode_num       = episode_num + 1
+    episode_steps     = 0
+    pending_action    = 0
+    chests_opened_ep  = 0
     info(string.format("Ep %d started — spawn (%.0f, %.0f) [pool=%d]",
         episode_num, sx, sy, #spawn_candidates))
 end
@@ -520,6 +526,39 @@ local function get_portal_signal(x, y)
     local dx_norm = math.max(0.0, math.min(1.0, (best_ex - x) / PORTAL_RANGE * 0.5 + 0.5))
     local dy_norm = math.max(0.0, math.min(1.0, (best_ey - y) / PORTAL_RANGE * 0.5 + 0.5))
     return { d / PORTAL_RANGE, dx_norm, dy_norm }
+end
+
+-- ── Auto-open chests on proximity ────────────────────────────────────────
+-- Scans all entities within CHEST_RANGE for ItemChestComponent and kills them.
+-- EntityKill() on a chest triggers its death handler: the engine spawns the
+-- chest's contents at that position.  We don't need to handle pickup — gold
+-- nuggets and items land on the ground and are visible to the existing radars.
+--
+-- Tag "chest" is not in the API docs (data.wak is packed), so we use the
+-- slower but reliable approach: check every entity in radius for the component.
+-- At CHEST_RANGE = 22px the entity count is small (typically 0–3).
+local function auto_open_chests(player, x, y)
+    local ok, ents = pcall(EntityGetInRadius, x, y, CHEST_RANGE)
+    if not ok or not ents then return 0 end
+    local opened = 0
+    for _, eid in ipairs(ents) do
+        if eid ~= player then
+            local chest_comp = EntityGetFirstComponent(eid, "ItemChestComponent")
+            if chest_comp then
+                local cok, cx, cy = pcall(EntityGetTransform, eid)
+                if cok then
+                    info(string.format(
+                        "Chest opened at (%.0f, %.0f) ep=%d step=%d",
+                        cx, cy, episode_num, episode_steps))
+                end
+                pcall(EntityKill, eid)
+                opened = opened + 1
+                chests_opened_total = chests_opened_total + 1
+                chests_opened_ep    = chests_opened_ep    + 1
+            end
+        end
+    end
+    return opened
 end
 
 -- ── Jetpack fuel (0=empty, 1=full) ───────────────────────────────────────
@@ -766,6 +805,11 @@ function OnWorldPostUpdate()
     local sky_ok, sky_v = pcall(GameGetSkyVisibility, x, y)
     local sky_visibility = (sky_ok and sky_v) and math.max(0.0, math.min(1.0, sky_v)) or 0.0
 
+    -- Auto-open nearby chests BEFORE building state (so the frame that triggers
+    -- opening is reported with the updated chests_opened_ep counter).
+    -- Only run on action frames (frame % FRAME_SKIP == 0) to keep cost low.
+    auto_open_chests(player, x, y)
+
     -- Current gold and kill count for reward tracking in Python
     local gold = 0
     local wallet = EntityGetFirstComponent(player, "WalletComponent")
@@ -784,9 +828,10 @@ function OnWorldPostUpdate()
     -- Periodic diagnostic log ──────────────────────────────────────────────
     if (frame % 300) == 0 then
         info(string.format(
-            "DIAG ep=%d step=%d pos=(%.0f,%.0f) vel=(%.1f,%.1f) vhp=%.2f gnd=%s act=%s fps=%.0f",
+            "DIAG ep=%d step=%d pos=(%.0f,%.0f) vel=(%.1f,%.1f) vhp=%.2f gnd=%s act=%s chests=%d fps=%.0f",
             episode_num, episode_steps, x, y, vx, vy, virtual_hp,
-            tostring(on_ground), ACTION_NAMES[last_action] or "?", fps))
+            tostring(on_ground), ACTION_NAMES[last_action] or "?",
+            chests_opened_ep, fps))
     end
 
     -- Death detection: virtual HP exhausted OR episode timeout ──────────────
@@ -801,7 +846,7 @@ function OnWorldPostUpdate()
             portal=portal_signal,
             jetpack_fuel=1.0, wand_ready=1.0,
             is_on_fire=0.0, is_poisoned=0.0, sky_visibility=sky_visibility,
-            gold=gold, kills=kills,
+            gold=gold, kills=kills, chests=chests_opened_ep,
             dead=true, on_ground=false, frame=frame
         }
         local ok4, encoded = pcall(json.encode, dead_state)
@@ -819,6 +864,7 @@ function OnWorldPostUpdate()
         jetpack_fuel=jetpack_fuel, wand_ready=wand_ready,
         is_on_fire=is_on_fire, is_poisoned=is_poisoned,
         sky_visibility=sky_visibility, gold=gold, kills=kills,
+        chests=chests_opened_ep,
         dead=false, on_ground=on_ground, frame=frame
     }
     local ok5, encoded = pcall(json.encode, state)

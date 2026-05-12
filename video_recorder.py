@@ -359,10 +359,32 @@ class VideoRecorder:
         )
         return buf.getvalue()
 
+    @staticmethod
+    def _read_recent_logs(n_lines: int = 30) -> str:
+        """Read the last N lines from logger.txt (Noita mod log)."""
+        log_path = os.path.join(os.path.dirname(__file__), "logger.txt")
+        try:
+            with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+            return "".join(lines[-n_lines:]).strip()
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _read_recent_actions(n: int = 20) -> str:
+        """Read the last N lines from actions_trace.jsonl."""
+        trace_path = os.path.join(os.path.dirname(__file__), "actions_trace.jsonl")
+        try:
+            with open(trace_path, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+            return "".join(lines[-n:]).strip()
+        except Exception:
+            return ""
+
     def _groq_describe(self, event_name: str, ctx: dict) -> str:
         template = _DESCRIPTIONS.get(event_name, "Extreme event: {name}")
         fallback = template.format(name=event_name, **{
-            k: ctx.get(k, "?") for k in (
+            k: ctx.get(k, 0.0) for k in (
                 "dist", "depth", "kills", "damage", "steps", "reward",
                 "chunks", "vx", "vy", "episode",
             )
@@ -373,28 +395,47 @@ class VideoRecorder:
 
         try:
             from groq import Groq
-            client = Groq(api_key=self._groq_key)
-            tag_list = ", ".join(HASHTAGS)
+            tag_list     = ", ".join(HASHTAGS)
+            noita_logs   = self._read_recent_logs(30)
+            action_trace = self._read_recent_actions(20)
+
             prompt = (
-                f"You are narrating a short gameplay clip of an AI bot playing Noita "
-                f"(roguelite dungeon game). Be brief, exciting, and factual.\n\n"
-                f"Event: {event_name}\n"
-                f"Data: {ctx}\n\n"
-                f"Write 1-2 sentences describing what happened, then choose exactly ONE "
-                f"hashtag from this list: {tag_list}. "
-                f"Format: <description>\\n<hashtag>. No markdown, no extra text."
+                "You are an AI analyst watching a Reinforcement Learning bot (PPO agent) "
+                "learn to play Noita — a roguelite physics-based dungeon crawler. "
+                "The bot controls the player using direct velocity injection, learns from "
+                "chunk-exploration rewards, kill bonuses, and depth progress.\n\n"
+
+                f"== TRIGGERED EVENT ==\n"
+                f"Type: {event_name}\n"
+                f"Stats: episode={ctx.get('episode','?')} steps={ctx.get('steps','?')} "
+                f"dist={ctx.get('dist',0):.0f}px depth={ctx.get('depth',0):.0f}px "
+                f"kills={ctx.get('kills','?')} reward={ctx.get('reward',0):.1f} "
+                f"chunks={ctx.get('chunks','?')}\n\n"
+
+                f"== LAST 30 LINES FROM NOITA MOD LOG ==\n{noita_logs}\n\n"
+
+                f"== LAST 20 ACTION TRACE ENTRIES (JSON) ==\n{action_trace}\n\n"
+
+                "Write a SHORT (2-3 sentences) analysis of what happened and why it's "
+                "interesting from an RL/training perspective. "
+                "Comment on what the agent likely learned or is struggling with. "
+                "Be specific — reference actual numbers from the logs. "
+                f"End with ONE hashtag from: {tag_list}. "
+                "Format: <analysis>\\n<hashtag>. Plain text only."
             )
+
             resp = Groq(api_key=self._groq_key).chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.85,
-                max_completion_tokens=90,
+                temperature=0.7,
+                max_completion_tokens=120,
                 top_p=1,
                 stream=False,
             )
             text = resp.choices[0].message.content.strip()
-            # Ensure the template hashtag is appended if Groq didn't include one
-            return text if any(h in text for h in HASHTAGS) else f"{text}\n{_EVENT_HASHTAG.get(event_name, '#BotGaming')}"
+            return text if any(h in text for h in HASHTAGS) else (
+                f"{text}\n{_EVENT_HASHTAG.get(event_name, '#BotGaming')}"
+            )
         except Exception as exc:
             logger.debug("VideoRecorder: Groq failed: {}", exc)
             return fallback
