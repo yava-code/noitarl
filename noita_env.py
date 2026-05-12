@@ -137,9 +137,19 @@ class NoitaEnv(gym.Env):
 
     async def _handle(self, ws) -> None:
         addr = ws.remote_address
-        logger.info("[env:{}] Noita connected from {}", self.port, addr)
         with self._lock:
+            if self._ws is not None:
+                # Two Noita instances connected to the same port — almost certainly
+                # a misconfigured port.txt in one of the copies.
+                logger.error(
+                    "[env:{}] REJECTED connection from {} — port already in use! "
+                    "Check that each Noita copy has a unique port.txt value.",
+                    self.port, addr,
+                )
+                await ws.close()
+                return
             self._ws = ws
+        logger.info("[env:{}] Noita connected from {}", self.port, addr)
         try:
             async for raw in ws:
                 try:

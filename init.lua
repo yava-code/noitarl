@@ -67,6 +67,29 @@ local WS_PORT = read_port()
 local WS_URL  = "ws://localhost:" .. WS_PORT
 info("Port: " .. WS_PORT)
 
+-- ── Optional game-speed multiplier (noita_dev.exe only) ───────────────────
+-- Read from speed.txt next to this mod. Values > 1 run the simulation faster.
+-- 2.0 is stable; > 3.0 may cause physics glitches.
+-- Silently skipped on the release build where SetGameSpeed doesn't exist.
+local function read_game_speed()
+    local f = io.open(mod_path("speed.txt"), "r")
+    if f then
+        local v = tonumber(f:read("*l"))
+        f:close()
+        if v and v > 0 then return v end
+    end
+    return nil  -- nil = don't touch game speed
+end
+local GAME_SPEED = read_game_speed()
+if GAME_SPEED then
+    local ok, err2 = pcall(SetGameSpeed, GAME_SPEED)
+    if ok then
+        info(string.format("Game speed set to %.1fx", GAME_SPEED))
+    else
+        warn("SetGameSpeed not available (release build?): " .. tostring(err2))
+    end
+end
+
 -- ── Connection state ──────────────────────────────────────────────────────
 local socket                    = nil
 local last_connection_attempt   = 0

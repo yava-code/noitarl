@@ -38,13 +38,29 @@ def make_env(port: int):
     return _init
 
 
-def train(n_envs: int, base_port: int, total_steps: int, resume: str | None):
+def find_latest_checkpoint(checkpoint_dir: str) -> "str | None":
+    import glob as _glob
+    zips = _glob.glob(os.path.join(checkpoint_dir, "*.zip"))
+    return max(zips, key=os.path.getmtime) if zips else None
+
+
+def train(n_envs: int, base_port: int, total_steps: int, resume: str | None, fresh: bool):
     cfg = Config()
     cfg.n_envs          = n_envs
     cfg.noita_base_port = base_port
     cfg.total_timesteps = total_steps
+
     if resume:
         cfg.resume_from = resume
+    elif not fresh:
+        latest = find_latest_checkpoint(cfg.checkpoint_dir)
+        if latest:
+            logger.info("Auto-resuming from latest checkpoint: {}", latest)
+            cfg.resume_from = latest
+        else:
+            logger.info("No checkpoint found — starting fresh")
+    else:
+        logger.info("--fresh flag set — starting new run")
 
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
     run_name = cfg.effective_run_name()
@@ -77,10 +93,17 @@ def train(n_envs: int, base_port: int, total_steps: int, resume: str | None):
     )
     callbacks = CallbackList([monitor_cb, checkpoint_cb])
 
-    if resume:
-        logger.info("Resuming from {}", resume)
-        model = PPO.load(resume, env=env, tensorboard_log=cfg.tensorboard_dir)
-    else:
+    if cfg.resume_from:
+        logger.info("Resuming from {}", cfg.resume_from)
+        try:
+            model = PPO.load(cfg.resume_from, env=env, tensorboard_log=cfg.tensorboard_dir)
+        except ValueError as exc:
+            if "Observation spaces do not match" in str(exc):
+                logger.warning("Checkpoint obs-space mismatch — starting fresh. ({})", exc)
+                cfg.resume_from = None
+            else:
+                raise
+    if not cfg.resume_from:
         try:
             import torch
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -104,7 +127,7 @@ def train(n_envs: int, base_port: int, total_steps: int, resume: str | None):
 
     try:
         model.learn(total_timesteps=total_steps, callback=callbacks,
-                    progress_bar=True, reset_num_timesteps=resume is None,
+                    progress_bar=True, reset_num_timesteps=cfg.resume_from is None,
                     tb_log_name=run_name)
         logger.success("Training complete!")
     except KeyboardInterrupt:
@@ -122,10 +145,11 @@ def train(n_envs: int, base_port: int, total_steps: int, resume: str | None):
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description="NoitaRL — multi-env PPO training")
     ap.add_argument("--envs",   type=int, default=2,         help="number of parallel Noita instances")
     ap.add_argument("--port",   type=int, default=5001,       help="base port (5001, 5002, …)")
     ap.add_argument("--steps",  type=int, default=1_000_000,  help="total training steps")
-    ap.add_argument("--resume", type=str, default=None,       help="path to .zip checkpoint to resume")
+    ap.add_argument("--resume", type=str, default=None,       help="path to specific .zip checkpoint")
+    ap.add_argument("--fresh",  action="store_true",          help="ignore existing checkpoints, start new run")
     args = ap.parse_args()
-    train(args.envs, args.port, args.steps, args.resume)
+    train(args.envs, args.port, args.steps, args.resume, args.fresh)

@@ -21,3 +21,13 @@ noita_ppo_tensorboard/
 .idea/
 .vscode/
 .DS_Store
+/wandb/
+/docs/superpowers/plans/2026-05-09-noita-rl-mvp.md
+/docs/superpowers/specs/2026-05-09-noita-rl-mvp-design.md
+/data/hall_of_fame/
+/data/highlights/
+/data/schemas/
+/crashes/
+/playbacks/
+/save00/
+/start_training.bat
