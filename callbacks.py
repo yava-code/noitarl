@@ -151,7 +151,6 @@ class NoitaMonitorCallback(BaseCallback):
             death_reason = info.get("noita/death_reason", "UNKNOWN")
             
             screenshot = info.get("noita/screenshot")
-            gif_bytes = info.get("noita/gif_bytes")
             route_x = info.get("noita/route_x", [])
             route_y = info.get("noita/route_y", [])
             visually_stuck = info.get("noita/visually_stuck", False)
@@ -190,16 +189,14 @@ class NoitaMonitorCallback(BaseCallback):
             if dist > self._best_spawn_distance:
                 self._best_spawn_distance = dist
                 self._on_new_record(dist, depth, kills, route_x, route_y, postcard)
-                # Send GIF if available on new record
-                if gif_bytes:
-                    try:
-                        # save locally first for hall of fame
-                        gif_path = f"data/hall_of_fame/run_{int(dist)}px_ep{self._total_episodes}.gif"
-                        with open(gif_path, "wb") as f:
-                            f.write(gif_bytes)
-                        self._tg.send_document(gif_path, caption=f"🎥 <b>Record Replay</b> ({dist:.0f}px)")
-                    except Exception as e:
-                        logger.error("Failed to process replay GIF: {}", e)
+                # Trigger VideoRecorder clip for new record (main process, good quality)
+                if self._recorder is not None:
+                    rec_ctx = {
+                        "dist": dist, "depth": depth, "kills": kills,
+                        "steps": l, "reward": r,
+                        "episode": self._total_episodes, "chunks": chunks,
+                    }
+                    self._recorder.force_trigger("new_distance_record", rec_ctx)
 
             # Check alerts
             if visually_stuck:
@@ -220,8 +217,7 @@ class NoitaMonitorCallback(BaseCallback):
                     "chunks":  chunks,
                 }
                 # New distance record
-                if dist > self._best_spawn_distance:
-                    rec.trigger_event("new_distance_record", ctx)
+                # new_distance_record: force_trigger already fired above (_best_spawn_distance check)
                 # New depth record (simple check — compare to last 5 ep max)
                 if len(self._ep_depths) == 0 or depth > max(list(self._ep_depths)[-5:] or [0]):
                     if depth > 500:   # only meaningful depth
@@ -238,9 +234,9 @@ class NoitaMonitorCallback(BaseCallback):
                 # Action loop
                 if action_loop:
                     rec.trigger_event("action_loop", ctx)
-                # Long survival milestone
-                if l >= 600 and death_reason != "DEAD":
-                    rec.trigger_event("long_survival", ctx)
+                # Long survival: per-step trigger in noita_env fires at step 600
+                # DURING the episode (captures real gameplay, not respawn screen).
+                # Here we keep only the high-reward variant for extra-long episodes.
                 # High episode reward
                 if r > 100.0:
                     rec.trigger_event("high_episode_reward", ctx)

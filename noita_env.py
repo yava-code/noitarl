@@ -33,15 +33,12 @@ import json
 import threading
 import time
 from typing import Any, Optional
-import collections
 from collections import Counter
-import io
 
 import numpy as np
 import websockets
 import gymnasium as gym
 from loguru import logger
-from PIL import Image
 
 
 def _capture_noita_frame() -> "Optional[Image.Image]":
@@ -100,11 +97,9 @@ class NoitaEnv(gym.Env):
         self.route_y: list[float] = []
         self.action_history: list[int] = []
 
-        self.frame_buffer = collections.deque(maxlen=30)
-        self.gif_skip = 0
-
         # Per-step event-detection state for VideoRecorder
         self._fast_mv_counter = 0        # consecutive steps with |vx|>120
+        self._long_survival_triggered = False   # fires once per episode at step 600
         self._recorder = None            # injected via set_recorder()
 
         self._start_server()
@@ -248,11 +243,12 @@ class NoitaEnv(gym.Env):
         self.max_x                   = 0.0
         self.total_damage            = 0.0
         self.episode_start_time      = time.time()
-        self.steps_without_progress  = 0
-        self.visited_chunks          = set()
-        self.route_x                 = []
-        self.route_y                 = []
-        self.action_history          = []
+        self.steps_without_progress   = 0
+        self.visited_chunks           = set()
+        self.route_x                  = []
+        self.route_y                  = []
+        self.action_history           = []
+        self._long_survival_triggered = False
 
         logger.debug("[env:{}] reset() — episode {}", self.port, self.episode_num)
 
@@ -302,14 +298,6 @@ class NoitaEnv(gym.Env):
         current_hp = state.get("hp", 0.0)
         dead       = state.get("dead", False)
 
-        # Capture frames for end-of-episode GIF via PrintWindow (works in background)
-        self.gif_skip += 1
-        if self.gif_skip >= 2:  # every 2 steps ≈ 7.5 FPS
-            self.gif_skip = 0
-            img = _capture_noita_frame()
-            if img is not None:
-                img.thumbnail((640, 360), Image.Resampling.LANCZOS)
-                self.frame_buffer.append(img)
 
         # Portal teleport detection — sudden large Δposition between frames is a
         # holy-mountain teleporter trigger (real walking caps at ~60 px/step).
@@ -463,6 +451,14 @@ class NoitaEnv(gym.Env):
             if current_kills > self.last_kills and int(action) in (6, 7):
                 rec.trigger_event("wand_kill", {**ctx_base, "kills": current_kills})
 
+            # 7. Long survival milestone — fires DURING the episode (at step 600)
+            # so the VideoRecorder pre-buffer contains actual ongoing gameplay,
+            # not the respawn screen that would appear if we triggered post-episode.
+            if self.episode_steps == 600 and not self._long_survival_triggered:
+                self._long_survival_triggered = True
+                rec.trigger_event("long_survival", {**ctx_base,
+                    "steps": self.episode_steps, "reward": self.episode_reward})
+
         visually_stuck = False
         action_loop = False
         if len(self.route_x) >= 200:
@@ -488,49 +484,23 @@ class NoitaEnv(gym.Env):
                 reason,
             )
             
-            screenshot_bytes = None
-            try:
-                img = _capture_noita_frame()
-                if img is not None:
-                    buf = io.BytesIO()
-                    img.save(buf, format="PNG")
-                    screenshot_bytes = buf.getvalue()
-            except Exception as exc:
-                logger.debug("[env:{}] Screenshot failed: {}", self.port, exc)
-
-            gif_bytes = None
-            try:
-                if len(self.frame_buffer) > 5:
-                    frames = list(self.frame_buffer)
-                    buf = io.BytesIO()
-                    pal = frames[0].quantize(colors=255, method=Image.Quantize.FASTOCTREE)
-                    q = [f.quantize(palette=pal, dither=1) for f in frames]
-                    q[0].save(buf, format="GIF", save_all=True,
-                              append_images=q[1:], duration=100, loop=0, optimize=False)
-                    gif_bytes = buf.getvalue()
-                    self.frame_buffer.clear()
-            except Exception as exc:
-                logger.debug("[env:{}] GIF generation failed: {}", self.port, exc)
-
             run_time = time.time() - self.episode_start_time
             info = {
                 "episode": {"r": self.episode_reward, "l": self.episode_steps},
-                "noita/visited_chunks":     len(self.visited_chunks),
-                "noita/max_spawn_distance": float(self.max_spawn_distance),
-                "noita/max_depth":          float(self.max_depth_y),
-                "noita/max_x":              float(self.max_x),
-                "noita/kills":              int(self.last_kills),
-                "noita/chests_opened":      int(self.last_chests),
-                "noita/total_damage":       float(self.total_damage),
-                "noita/run_time_s":         float(run_time),
+                "noita/visited_chunks":         len(self.visited_chunks),
+                "noita/max_spawn_distance":     float(self.max_spawn_distance),
+                "noita/max_depth":              float(self.max_depth_y),
+                "noita/max_x":                  float(self.max_x),
+                "noita/kills":                  int(self.last_kills),
+                "noita/chests_opened":          int(self.last_chests),
+                "noita/total_damage":           float(self.total_damage),
+                "noita/run_time_s":             float(run_time),
                 "noita/steps_without_progress": int(self.steps_without_progress),
-                "noita/death_reason":       reason,
-                "noita/screenshot":         screenshot_bytes,
-                "noita/gif_bytes":          gif_bytes,
-                "noita/route_x":            self.route_x,
-                "noita/route_y":            self.route_y,
-                "noita/visually_stuck":     visually_stuck,
-                "noita/action_loop":        action_loop,
+                "noita/death_reason":           reason,
+                "noita/route_x":                self.route_x,
+                "noita/route_y":                self.route_y,
+                "noita/visually_stuck":         visually_stuck,
+                "noita/action_loop":            action_loop,
             }
             with self._lock:
                 self._state = None   # force reset() to wait for fresh state
