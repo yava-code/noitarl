@@ -264,7 +264,7 @@ class NoitaMonitorCallback(BaseCallback):
             self.logger.record("noita/total_damage",       total_damage)
 
             # W&B per-episode
-            if self._cfg.wandb_enabled and _WANDB_OK:
+            if self._cfg.wandb_enabled and _WANDB_OK and wandb.run is not None:
                 wandb.log({
                     "episode/reward":         r,
                     "episode/length":         l,
@@ -298,7 +298,7 @@ class NoitaMonitorCallback(BaseCallback):
         sps = self.num_timesteps / max(elapsed, 1)
 
         # W&B rollout metrics
-        if self._cfg.wandb_enabled and _WANDB_OK:
+        if self._cfg.wandb_enabled and _WANDB_OK and wandb.run is not None:
             wandb.log({
                 "rollout/mean_reward":          mean_r,
                 "rollout/mean_ep_length":       mean_l,

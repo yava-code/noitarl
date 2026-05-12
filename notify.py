@@ -219,20 +219,67 @@ class TelegramNotifier:
         """fn() should return a formatted string of current training stats."""
         self._stats_fn = fn
 
+    @staticmethod
+    def _find_noita_bounds() -> Optional[dict]:
+        """Return window bounds for any window with 'noita' in title, or None."""
+        try:
+            import pygetwindow as gw
+            matches = [t for t in gw.getAllTitles() if "noita" in t.lower() and t.strip()]
+            for title in matches:
+                try:
+                    wins = gw.getWindowsWithTitle(title)
+                    if wins:
+                        w = wins[0]
+                        if w.width >= 50 and w.height >= 50:
+                            return {"top": max(0, w.top), "left": max(0, w.left),
+                                    "width": w.width, "height": w.height}
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        try:
+            import ctypes
+            import ctypes.wintypes as wt
+            found: list = []
+
+            @ctypes.WINFUNCTYPE(ctypes.c_bool, wt.HWND, wt.LPARAM)
+            def _cb(hwnd, _):
+                if not ctypes.windll.user32.IsWindowVisible(hwnd):
+                    return True
+                ln = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+                if not ln:
+                    return True
+                buf = ctypes.create_unicode_buffer(ln + 1)
+                ctypes.windll.user32.GetWindowTextW(hwnd, buf, ln + 1)
+                if "noita" in buf.value.lower():
+                    r = wt.RECT()
+                    ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(r))
+                    w, h = r.right - r.left, r.bottom - r.top
+                    if w >= 50 and h >= 50:
+                        found.append({"top": max(0, r.top), "left": max(0, r.left),
+                                      "width": w, "height": h})
+                        return False
+                return True
+
+            ctypes.windll.user32.EnumWindows(_cb, 0)
+            if found:
+                return found[0]
+        except Exception:
+            pass
+        return None
+
     def capture_noita_screen(self, overlay_text: str = "") -> bytes:
         import io
         try:
-            import pygetwindow as gw
             import mss
             from PIL import Image
-            
-            windows = gw.getWindowsWithTitle("Noita")
-            if not windows:
+
+            bounds = self._find_noita_bounds()
+            if not bounds:
                 return b""
-            
-            win = windows[0]
+
             with mss.mss() as sct:
-                monitor = {"top": win.top, "left": win.left, "width": win.width, "height": win.height}
+                monitor = bounds
                 sct_img = sct.grab(monitor)
                 img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
                 
@@ -343,18 +390,19 @@ class TelegramNotifier:
                         cq = update["callback_query"]
                         cq_id = cq["id"]
                         data = cq.get("data", "")
-                        
+
                         cmd = f"/{data}"
                         handler = self._handlers.get(cmd)
+                        # Answer immediately — Telegram shows spinner until answered,
+                        # and times out after 10 s. Handlers can take much longer.
+                        self._answer_callback_query(cq_id)
                         if handler:
-                            try:
-                                handler()
-                                self._answer_callback_query(cq_id, "Action completed")
-                            except Exception as exc:
-                                logger.warning("Telegram callback handler '{}' raised: {}", data, exc)
-                                self._answer_callback_query(cq_id, "Error executing action")
-                        else:
-                            self._answer_callback_query(cq_id)
+                            def _run(h=handler, d=data):
+                                try:
+                                    h()
+                                except Exception as exc:
+                                    logger.warning("Telegram callback handler '{}' raised: {}", d, exc)
+                            threading.Thread(target=_run, daemon=True, name=f"tg-cb-{data}").start()
             except Exception as exc:
                 logger.debug("Telegram poll error (will retry): {}", exc)
             time.sleep(2)

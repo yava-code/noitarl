@@ -197,32 +197,77 @@ class VideoRecorder:
                 if bounds is None:
                     return None
                 self._window_bounds = bounds
+                logger.debug("VideoRecorder: found window bounds {}", bounds)
             with mss.mss() as sct:
                 raw = sct.grab(bounds)
                 img = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
                 return img.resize((self.FRAME_W, self.FRAME_H), Image.BILINEAR)
-        except Exception:
+        except Exception as exc:
+            logger.debug("VideoRecorder: frame grab failed ({}), re-searching window", exc)
             self._window_bounds = None
             return None
 
     @staticmethod
     def _find_noita_window() -> Optional[dict]:
+        # Try pygetwindow first (any title containing "noita" — covers noita_dev.exe too)
         try:
             import pygetwindow as gw
-            wins = gw.getWindowsWithTitle("Noita")
-            if not wins:
-                return None
-            w = wins[0]
-            if w.width < 50 or w.height < 50:
-                return None
-            return {
-                "top":    max(0, w.top),
-                "left":   max(0, w.left),
-                "width":  w.width,
-                "height": w.height,
-            }
+            matches = [t for t in gw.getAllTitles() if "noita" in t.lower() and t.strip()]
+            for title in matches:
+                try:
+                    wins = gw.getWindowsWithTitle(title)
+                    if wins:
+                        w = wins[0]
+                        if w.width >= 50 and w.height >= 50:
+                            return {
+                                "top":   max(0, w.top),
+                                "left":  max(0, w.left),
+                                "width": w.width,
+                                "height": w.height,
+                            }
+                except Exception:
+                    continue
         except Exception:
-            return None
+            pass
+
+        # Fallback: Win32 ctypes — no extra packages needed on Windows
+        try:
+            import ctypes
+            import ctypes.wintypes as wt
+
+            found: list[dict] = []
+
+            @ctypes.WINFUNCTYPE(ctypes.c_bool, wt.HWND, wt.LPARAM)
+            def _enum_cb(hwnd, _):
+                if not ctypes.windll.user32.IsWindowVisible(hwnd):
+                    return True
+                length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+                if length == 0:
+                    return True
+                buf = ctypes.create_unicode_buffer(length + 1)
+                ctypes.windll.user32.GetWindowTextW(hwnd, buf, length + 1)
+                if "noita" in buf.value.lower():
+                    rect = wt.RECT()
+                    ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect))
+                    w = rect.right - rect.left
+                    h = rect.bottom - rect.top
+                    if w >= 50 and h >= 50:
+                        found.append({
+                            "top":   max(0, rect.top),
+                            "left":  max(0, rect.left),
+                            "width": w,
+                            "height": h,
+                        })
+                        return False  # stop after first match
+                return True
+
+            ctypes.windll.user32.EnumWindows(_enum_cb, 0)
+            if found:
+                return found[0]
+        except Exception:
+            pass
+
+        return None
 
     # ── Event loop ────────────────────────────────────────────────────────────
 

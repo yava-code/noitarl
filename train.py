@@ -62,7 +62,7 @@ def setup_wandb(cfg: Config, run_name: str) -> None:
         return
     try:
         import wandb
-        wandb.init(
+        run = wandb.init(
             project=cfg.wandb_project,
             entity=cfg.wandb_entity or None,
             name=run_name,
@@ -76,9 +76,14 @@ def setup_wandb(cfg: Config, run_name: str) -> None:
             },
             sync_tensorboard=True,
         )
-        logger.info("W&B run started: {}/{}", cfg.wandb_project, run_name)
+        if run is None:
+            logger.warning("W&B init returned None. Disabling W&B for this run.")
+            cfg.wandb_enabled = False
+        else:
+            logger.info("W&B run started: {}/{}", cfg.wandb_project, run_name)
     except Exception as exc:
-        logger.warning("W&B init failed (continuing without it): {}", exc)
+        logger.warning("W&B init failed (disabling W&B): {}", exc)
+        cfg.wandb_enabled = False
 
 
 def find_latest_checkpoint(checkpoint_dir: str) -> str | None:

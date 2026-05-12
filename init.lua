@@ -288,11 +288,12 @@ local function apply_action(player, action)
                 -- PlatformShooterPlayerComponent owns the smoothed aim vector that
                 -- drives sprite flip + visible reticle. Without writing here, our
                 -- ControlsComponent aim is overwritten by platformshooterplayer_system.
+                -- NOTE: do NOT write mDesiredCameraPos here — that snaps the camera
+                -- to the enemy world position every frame, causing convulsions and
+                -- "allocate 64x64 failed" terrain allocation spam.
                 local pspc = EntityGetFirstComponent(player, "PlatformShooterPlayerComponent")
                 if pspc then
-                    cset(pspc, "mSmoothedAimingVector",      nxv, nyv)
-                    cset(pspc, "mDesiredCameraPos",          nx, ny)
-                    cset(pspc, "mDesiredCameraPosForGfx",    nx, ny)
+                    cset(pspc, "mSmoothedAimingVector", nxv, nyv)
                 end
 
                 -- CharacterPlatformingComponent stores facing direction used by sprite.
