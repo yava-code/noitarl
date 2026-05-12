@@ -75,6 +75,12 @@ def train(n_envs: int, base_port: int, total_steps: int, resume: str | None):
         logger.info("Resuming from {}", resume)
         model = PPO.load(resume, env=env, tensorboard_log=cfg.tensorboard_dir)
     else:
+        try:
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        except Exception:
+            device = "auto"
+        logger.info("PPO device: {}", device)
         model = PPO(
             "MlpPolicy", env,
             verbose=1, learning_rate=cfg.learning_rate, n_steps=cfg.n_steps,
@@ -83,6 +89,7 @@ def train(n_envs: int, base_port: int, total_steps: int, resume: str | None):
             ent_coef=cfg.ent_coef, vf_coef=cfg.vf_coef,
             max_grad_norm=cfg.max_grad_norm,
             tensorboard_log=cfg.tensorboard_dir,
+            device=device,
         )
 
     logger.info("Training {}×{:,} steps, ~{:.1f}h per env",

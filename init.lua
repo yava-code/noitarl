@@ -78,11 +78,18 @@ local gui                       = nil
 -- ── Movement constants ────────────────────────────────────────────────────
 local MOVE_SPEED     = 60
 local JUMP_SPEED     = -150
+local JETPACK_DV     = 12     -- vy delta per tick while JETPACK_HOLD action is on
+local JETPACK_MAX_VY = -200   -- terminal upward velocity (clamp)
+local JETPACK_FUEL_BURN = 8   -- mFlyingTimeLeft units burned per tick
+local KICK_RANGE     = 30     -- px from player to count enemies for KICK
+local KICK_DAMAGE    = 0.5    -- engine HP units (≈ 12% of player max)
+local KICK_COOLDOWN  = 15     -- frames between KICK actions to prevent DPS-spam
 local FRAME_SKIP     = 4      -- Process action/state every 4 frames (trade-off: reduces CPU overhead while keeping fast 15 FPS reactions)
 
--- Jetpack is intentionally disabled — actions 3/4/5 are no-ops vertically
--- when airborne. Without this constraint the agent learns to fly to the
--- ceiling and farms exploration bonus from sky chunks indefinitely.
+-- Bare JUMP (action 3/4/5) still requires on_ground; only the explicit JETPACK_HOLD
+-- (action 9) burns fuel for sustained ascent. The sky-farm exploit (flying to the
+-- ceiling to harvest chunk bonus) is countered on the Python side by gating chunk
+-- reward on sky_visibility < 0.3.
 
 -- ── Initial descent: drop the player from the surface into the Mines on ──
 -- the very first frame, then make THAT the spawn point. The surface biome
@@ -102,24 +109,30 @@ local VIRTUAL_MAX_HP = 4.0    -- 4.0 engine units ≈ 100% HP in UI
 local virtual_hp     = VIRTUAL_MAX_HP
 
 -- ── Per-frame state ───────────────────────────────────────────────────────
--- Discrete 8 action space (jump+move composable, fire+aim_down for digging)
---   0 IDLE | 1 LEFT | 2 RIGHT | 3 JUMP | 4 L+JUMP | 5 R+JUMP | 6 FIRE | 7 FIRE_DOWN
+-- Discrete 10 action space:
+--   0 IDLE | 1 LEFT | 2 RIGHT | 3 JUMP | 4 L+JUMP | 5 R+JUMP
+--   6 FIRE | 7 FIRE_DOWN | 8 KICK | 9 JETPACK_HOLD
 local pending_action  = 0
 local last_action     = 0
+local last_facing     = 1     -- last non-zero horizontal direction (for KICK aim)
+local last_kick_frame = -1000
 local ACTION_NAMES    = {
     [0]="IDLE", [1]="LEFT", [2]="RIGHT", [3]="JUMP",
     [4]="L+JMP", [5]="R+JMP", [6]="FIRE", [7]="DIG_D",
+    [8]="KICK", [9]="JETPK",
 }
--- Movement decomposition for each action: {move_x, do_jump, do_fire, aim_down}
+-- Decomposition: {move_x, do_jump, do_fire, aim_down, do_kick, do_jetpack}
 local ACTION_DECODE = {
-    [0]={ 0, false, false, false },
-    [1]={-1, false, false, false },
-    [2]={ 1, false, false, false },
-    [3]={ 0, true,  false, false },
-    [4]={-1, true,  false, false },
-    [5]={ 1, true,  false, false },
-    [6]={ 0, false, true,  false },
-    [7]={ 0, false, true,  true  },
+    [0]={ 0, false, false, false, false, false },
+    [1]={-1, false, false, false, false, false },
+    [2]={ 1, false, false, false, false, false },
+    [3]={ 0, true,  false, false, false, false },
+    [4]={-1, true,  false, false, false, false },
+    [5]={ 1, true,  false, false, false, false },
+    [6]={ 0, false, true,  false, false, false },
+    [7]={ 0, false, true,  true,  false, false },
+    [8]={ 0, false, false, false, true,  false },
+    [9]={ 0, false, false, false, false, true  },
 }
 local MAX_EP_STEPS    = 4000  -- ~4.5 min at 60 fps with FRAME_SKIP=4
 
@@ -162,8 +175,10 @@ local function apply_action(player, action)
     last_action = action
 
     local decode = ACTION_DECODE[action] or ACTION_DECODE[0]
-    local move_x, do_jump, do_fire, aim_down =
-        decode[1], decode[2], decode[3], decode[4]
+    local move_x, do_jump, do_fire, aim_down, do_kick, do_jetpack =
+        decode[1], decode[2], decode[3], decode[4], decode[5], decode[6]
+
+    if move_x ~= 0 then last_facing = move_x end
 
     -- Physics: write velocity directly (mVelocity bypasses Noita's input layer)
     local vx_out, vy_out, on_ground_now = 0, 0, false
@@ -179,15 +194,50 @@ local function apply_action(player, action)
         local target_vx = move_x * MOVE_SPEED
         local new_vx    = target_vx
 
-        -- Vertical: jump only fires when grounded. No jetpack — see comment
-        -- near JUMP_SPEED for why. In-air JUMP becomes a no-op vertically.
+        -- Vertical:
+        --   Bare JUMP (3/4/5) only fires when grounded.
+        --   JETPACK_HOLD (9) adds upward Δv every tick while fuel remains.
         local new_vy = cur_vy
         if do_jump and on_ground_now then
             new_vy = JUMP_SPEED
         end
+        if do_jetpack then
+            local fuel = cget(cdata, "mFlyingTimeLeft") or 0
+            if fuel > 0 then
+                new_vy = math.max(cur_vy - JETPACK_DV, JETPACK_MAX_VY)
+                cset(cdata, "mFlyingTimeLeft", math.max(0, fuel - JETPACK_FUEL_BURN))
+            end
+        end
 
         cset(cdata, "mVelocity", new_vx, new_vy)
         vx_out, vy_out = new_vx, new_vy
+    end
+
+    -- KICK: melee damage to enemies within KICK_RANGE in front of player.
+    -- Hand-rolled because Noita's player has no MeleeAttackComponent by default.
+    if do_kick then
+        local frame = GameGetFrameNum()
+        if frame - last_kick_frame >= KICK_COOLDOWN then
+            last_kick_frame = frame
+            local pok, px, py = pcall(EntityGetTransform, player)
+            if pok then
+                local eok, ents = pcall(EntityGetInRadiusWithTag, px, py, KICK_RANGE, "enemy")
+                if eok and ents then
+                    for _, eid in ipairs(ents) do
+                        local tok, ex, ey = pcall(EntityGetTransform, eid)
+                        if tok then
+                            -- Front-facing hemisphere: enemy must be on the
+                            -- facing side OR within 12 px vertically (kick up/down).
+                            if (ex - px) * last_facing >= -8 then
+                                pcall(EntityInflictDamage, eid, KICK_DAMAGE, "melee",
+                                    "kicked", "BLOOD", last_facing * 250, -50, player,
+                                    ex, ey, 200)
+                            end
+                        end
+                    end
+                end
+            end
+        end
     end
 
     -- Aiming + firing on ControlsComponent
@@ -220,8 +270,31 @@ local function apply_action(player, action)
             local dx, dy = nx - px, ny - py
             local len = math.sqrt(dx*dx + dy*dy)
             if len > 0.001 then
-                cset(ctrl, "mAimingVectorNormalized", dx/len, dy/len)
-                cset(ctrl, "mMousePosition", nx, ny)
+                local nxv, nyv = dx/len, dy/len
+                -- ControlsComponent gets pummelled by the engine's input layer each
+                -- frame; writing aim here is necessary but not sufficient.
+                cset(ctrl, "mAimingVectorNormalized", nxv, nyv)
+                cset(ctrl, "mAimingVector",           nxv * 40, nyv * 40)
+                cset(ctrl, "mMousePosition",          nx, ny)
+                cset(ctrl, "mMousePositionRaw",       nx, ny)
+                cset(ctrl, "mGamePadCursorInWorld",   nx, ny)
+                cset(ctrl, "mGamepadIndirectAiming",  nxv, nyv)
+
+                -- PlatformShooterPlayerComponent owns the smoothed aim vector that
+                -- drives sprite flip + visible reticle. Without writing here, our
+                -- ControlsComponent aim is overwritten by platformshooterplayer_system.
+                local pspc = EntityGetFirstComponent(player, "PlatformShooterPlayerComponent")
+                if pspc then
+                    cset(pspc, "mSmoothedAimingVector",      nxv, nyv)
+                    cset(pspc, "mDesiredCameraPos",          nx, ny)
+                    cset(pspc, "mDesiredCameraPosForGfx",    nx, ny)
+                end
+
+                -- CharacterPlatformingComponent stores facing direction used by sprite.
+                local cplat = EntityGetFirstComponent(player, "CharacterPlatformingComponent")
+                if cplat then
+                    cset(cplat, "mFacingDirection", (nxv >= 0) and 1 or -1)
+                end
             end
         end
 
@@ -417,6 +490,38 @@ local function build_gold_radar(x, y)
     return sectors
 end
 
+-- ── Portal signal (Holy Mountain teleporter) ─────────────────────────────
+-- Returns {dist_norm, dx_norm, dy_norm} in [0,1]:
+--   dist_norm = 1   → no portal within PORTAL_RANGE
+--   dx_norm   = 0.5 → portal directly above/below; <0.5 left, >0.5 right
+--   dy_norm   = 0.5 → portal at same Y; <0.5 above, >0.5 below
+-- Holy Mountain teleporters carry tag "teleport_active"; we try a couple of
+-- other tags too in case the engine renames them in different biomes.
+local PORTAL_RANGE = 400
+local PORTAL_TAGS  = { "teleport_active", "portal", "teleportable_NOT_player" }
+
+local function get_portal_signal(x, y)
+    local best_d2, best_ex, best_ey = math.huge, nil, nil
+    for _, tag in ipairs(PORTAL_TAGS) do
+        local ok, ents = pcall(EntityGetWithTag, tag)
+        if ok and ents then
+            for _, eid in ipairs(ents) do
+                local tok, ex, ey = pcall(EntityGetTransform, eid)
+                if tok then
+                    local d2 = (ex - x)^2 + (ey - y)^2
+                    if d2 < best_d2 then best_d2, best_ex, best_ey = d2, ex, ey end
+                end
+            end
+        end
+    end
+    if not best_ex then return { 1.0, 0.5, 0.5 } end
+    local d = math.sqrt(best_d2)
+    if d > PORTAL_RANGE then return { 1.0, 0.5, 0.5 } end
+    local dx_norm = math.max(0.0, math.min(1.0, (best_ex - x) / PORTAL_RANGE * 0.5 + 0.5))
+    local dy_norm = math.max(0.0, math.min(1.0, (best_ey - y) / PORTAL_RANGE * 0.5 + 0.5))
+    return { d / PORTAL_RANGE, dx_norm, dy_norm }
+end
+
 -- ── Jetpack fuel (0=empty, 1=full) ───────────────────────────────────────
 local JETPACK_MAX = 1000.0   -- default mFlyingTimeLeft value = full tank
 
@@ -428,17 +533,30 @@ local function get_jetpack_fuel(player)
 end
 
 -- ── Wand ready (1=can fire, 0=on cooldown) ───────────────────────────────
+-- The player has many children (perks, inventory items, the wand). We want the
+-- WAND specifically — wand entities have tag "wand" or "card_action". Reading
+-- AbilityComponent from the first child (e.g. a perk) gives garbage cooldowns.
 local function get_wand_ready(player)
     local frame    = GameGetFrameNum()
     local children = EntityGetAllChildren(player) or {}
+    local wand_ab  = nil
     for _, child in ipairs(children) do
-        local ab = EntityGetFirstComponent(child, "AbilityComponent")
-        if ab then
-            local next_use = cget(ab, "mNextFrameUsable") or 0
-            return (frame >= next_use) and 1.0 or 0.0
+        local is_wand = pcall(EntityHasTag, child, "wand") and EntityHasTag(child, "wand")
+        if is_wand then
+            wand_ab = EntityGetFirstComponent(child, "AbilityComponent")
+            if wand_ab then break end
         end
     end
-    return 1.0
+    if not wand_ab then
+        -- Fall back: any AbilityComponent on any child (old behaviour).
+        for _, child in ipairs(children) do
+            local ab = EntityGetFirstComponent(child, "AbilityComponent")
+            if ab then wand_ab = ab; break end
+        end
+    end
+    if not wand_ab then return 1.0 end
+    local next_use = cget(wand_ab, "mNextFrameUsable") or 0
+    return (frame >= next_use) and 1.0 or 0.0
 end
 
 -- ── Build 16-ray state table ──────────────────────────────────────────────
@@ -626,13 +744,23 @@ function OnWorldPostUpdate()
     local enemy_radar      = build_enemy_radar(x, y)
     local projectile_radar = build_projectile_radar(x, y)
     local gold_radar       = build_gold_radar(x, y)
+    local portal_signal    = get_portal_signal(x, y)
     local jetpack_fuel     = get_jetpack_fuel(player)
     local wand_ready       = get_wand_ready(player)
 
-    local ok1, fc1 = pcall(GameGetGameEffectCount, player, "ON_FIRE")
-    local is_on_fire  = (ok1 and fc1 and fc1 > 0) and 1.0 or 0.0
-    local ok2, fc2 = pcall(GameGetGameEffectCount, player, "RADIOACTIVE")
-    local is_poisoned = (ok2 and fc2 and fc2 > 0) and 1.0 or 0.0
+    -- Fire: read DamageModelComponent.is_on_fire (the engine sets this directly).
+    -- The GameEffect "ON_FIRE" doesn't exist in Noita — burning is a stain/material
+    -- contact, not a game effect, so GameGetGameEffectCount always returned 0.
+    local is_on_fire = 0.0
+    if dmg then
+        is_on_fire = (cget(dmg, "is_on_fire") == true) and 1.0 or 0.0
+    end
+    -- Poison/radiation: try several effect names — engine builds differ.
+    local is_poisoned = 0.0
+    for _, eff in ipairs({"RADIOACTIVE", "POISONED", "STAINED_RADIOACTIVE"}) do
+        local ok_eff, fc = pcall(GameGetGameEffectCount, player, eff)
+        if ok_eff and fc and fc > 0 then is_poisoned = 1.0; break end
+    end
 
     -- Sky visibility: 1=open sky, 0=deep underground (depth proxy)
     local sky_ok, sky_v = pcall(GameGetSkyVisibility, x, y)
@@ -670,6 +798,7 @@ function OnWorldPostUpdate()
             x=x, y=y, hp=0.0, vx=0.0, vy=0.0,
             rays=rays, liquid_sensors=liquid_sensors, enemy_radar=enemy_radar,
             projectile_radar=projectile_radar, gold_radar=gold_radar,
+            portal=portal_signal,
             jetpack_fuel=1.0, wand_ready=1.0,
             is_on_fire=0.0, is_poisoned=0.0, sky_visibility=sky_visibility,
             gold=gold, kills=kills,
@@ -686,6 +815,7 @@ function OnWorldPostUpdate()
         x=x, y=y, hp=hp_norm, vx=vx, vy=vy,
         rays=rays, liquid_sensors=liquid_sensors, enemy_radar=enemy_radar,
         projectile_radar=projectile_radar, gold_radar=gold_radar,
+        portal=portal_signal,
         jetpack_fuel=jetpack_fuel, wand_ready=wand_ready,
         is_on_fire=is_on_fire, is_poisoned=is_poisoned,
         sky_visibility=sky_visibility, gold=gold, kills=kills,

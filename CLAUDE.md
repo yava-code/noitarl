@@ -61,7 +61,7 @@ by `PlayerCollisionSystem`.
 
 ---
 
-## Observation space (57 float32, all in [0, 1])
+## Observation space (60 float32, all in [0, 1])
 
 | Index   | Feature | Notes |
 |---------|---------|-------|
@@ -76,25 +76,32 @@ by `PlayerCollisionSystem`.
 | 51      | on_ground          | 0 or 1 |
 | 52      | jetpack fuel       | 0 = empty, 1 = full |
 | 53      | wand ready         | 0 = on cooldown, 1 = can fire |
-| 54      | is_on_fire         | 0 or 1 |
-| 55      | is_poisoned        | 0 or 1 |
+| 54      | is_on_fire         | 0 or 1; from DamageModelComponent.is_on_fire |
+| 55      | is_poisoned        | 0 or 1; any of RADIOACTIVE/POISONED/STAINED_RADIOACTIVE |
 | 56      | sky_visibility     | 1 = surface, 0 = deep underground (depth proxy) |
+| 57      | portal distance    | 1 = no portal in 400 px, 0 = at portal |
+| 58      | portal dx_norm     | 0.5 = same X; <0.5 portal is left, >0.5 portal is right |
+| 59      | portal dy_norm     | 0.5 = same Y; <0.5 portal is above, >0.5 portal is below |
 
-## Action space (Discrete 8)
+## Action space (Discrete 10)
 
 Composable move+jump so the agent can hop over corridor ledges. Fire is a
-separate action; action 7 forces aim straight down ("dig").
+separate action; action 7 forces aim straight down ("dig"). KICK is a
+short-range melee that bypasses wand cooldown. JETPACK_HOLD burns fuel
+for sustained ascent.
 
 | Value | Effect |
 |-------|--------|
-| 0 | IDLE       — vx target = 0, no jump, no fire |
-| 1 | LEFT       — vx = −60 |
-| 2 | RIGHT      — vx = +60 |
-| 3 | JUMP       — vy = −150 (only when on_ground; no-op airborne) |
-| 4 | LEFT+JUMP  — vx = −60 AND jump (vertical part only triggers grounded) |
-| 5 | RIGHT+JUMP — vx = +60 AND jump (vertical part only triggers grounded) |
-| 6 | FIRE       — auto-aim at nearest enemy, fire wand |
-| 7 | FIRE_DOWN  — aim straight down, fire wand (used for digging) |
+| 0 | IDLE          — vx target = 0, no jump, no fire |
+| 1 | LEFT          — vx = −60 |
+| 2 | RIGHT         — vx = +60 |
+| 3 | JUMP          — vy = −150 (only when on_ground; no-op airborne) |
+| 4 | LEFT+JUMP     — vx = −60 AND jump (vertical part only triggers grounded) |
+| 5 | RIGHT+JUMP    — vx = +60 AND jump (vertical part only triggers grounded) |
+| 6 | FIRE          — auto-aim at nearest enemy, fire wand |
+| 7 | FIRE_DOWN     — aim straight down, fire wand (used for digging) |
+| 8 | KICK          — 0.5 melee damage in 30 px hemisphere ahead, 15-frame cooldown |
+| 9 | JETPACK_HOLD  — Δvy = −12/tick, burns mFlyingTimeLeft (no horizontal effect) |
 
 No smoothing: `mVelocity.x` is set to the target every action tick. This
 tightens credit assignment but means the agent can stop on a dime.
@@ -102,13 +109,16 @@ tightens credit assignment but means the agent can stop on a dime.
 ## Reward function
 
 ```
-−0.001                       time tax (small)
-+0.02 × Δmanhattan_from_spawn  when a new max distance from spawn is reached
-+0.5                          per newly visited 32×32 chunk (curiosity)
-+0.02 × Δdepth_y              small bonus for new depth record
-−1.0 × Δhp                    damage taken this step
-+5.0  × Δkills                enemies killed
-−1.0                          on death
+−0.001                            time tax (small)
++0.02 × Δmanhattan_from_spawn      when a new max distance from spawn is reached
++0.5                               per newly visited 32×32 chunk (skipped if sky_visibility ≥ 0.3 — anti sky-farm)
++0.02 × Δdepth_y                   small bonus for new depth record
+−1.0  × Δhp                        damage taken this step
++5.0  × Δkills                     enemies killed
++0.05                              FIRE/FIRE_DOWN pressed AND enemy in 250 px (aim-on-enemy bonus)
++(0.3 − portal_dist) × 0.05        gradient pulling agent into portal (only when within 30% of PORTAL_RANGE)
++20.0                              one-shot bonus on detected portal teleport (Δpos > 300 px AND was near portal last step)
+−1.0                               on death
 truncate after 600 steps without progress  (no penalty — just ends episode)
 ```
 
@@ -172,10 +182,12 @@ python train_multi.py --envs 2 --resume checkpoints/noita_ppo_2env_400000_steps.
   the first platform below (`INITIAL_DESCENT_RANGE = 1500 px`,
   `INITIAL_DESCENT_LIFT = 20 px`). That post-descent position is what
   `spawn_candidates` records — every subsequent respawn lands underground.
-- **Jetpack is disabled.** The `JUMP` actions (3, 4, 5) only set `vy =
-  JUMP_SPEED` when `is_on_ground` is true. Airborne, they are vertically
-  no-ops. Re-enabling jetpack lets the agent farm sky-chunk curiosity
-  indefinitely by flying upward.
+- **Jetpack is action 9 (JETPACK_HOLD).** Bare JUMP (3/4/5) still only fires
+  when grounded; airborne JUMP is a no-op. Action 9 adds Δvy = −12/tick and
+  burns `mFlyingTimeLeft` by 8/tick. The classic sky-farm exploit (fly up,
+  collect chunk reward, repeat) is blocked on the Python side by gating
+  `+0.5 chunk reward` on `sky_visibility < 0.3` — visiting open sky pays
+  nothing.
 - **FRAME_SKIP = 4**. We process an action and send state every 4 frames (15 times 
   a second at 60 FPS). This is a trade-off: it reduces CPU overhead and network 
   latency while being fast enough for the agent to react to Noita's physics. 

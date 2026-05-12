@@ -131,6 +131,12 @@ def train(args: argparse.Namespace) -> None:
             else:
                 raise
     if not cfg.resume_from:
+        try:
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        except Exception:
+            device = "auto"
+        logger.info("PPO device: {}", device)
         model = PPO(
             "MlpPolicy",
             env,
@@ -146,6 +152,7 @@ def train(args: argparse.Namespace) -> None:
             vf_coef          = cfg.vf_coef,
             max_grad_norm    = cfg.max_grad_norm,
             tensorboard_log  = cfg.tensorboard_dir,
+            device           = device,
         )
 
     # ── Callbacks ─────────────────────────────────────────────────────────────

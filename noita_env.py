@@ -1,7 +1,7 @@
 """
 Gymnasium environment bridging Python ↔ Noita via WebSocket.
 
-Observation (57 float32, all in [0, 1]):
+Observation (60 float32, all in [0, 1]):
   [0..15]   16 platform rays       (0=wall, 1=150 px clear)
   [16..23]   8 enemy radar sectors  (1=none, 0=enemy at player)
   [24..31]   8 liquid sensors       (0=dry, ~1=pool ahead)
@@ -16,10 +16,14 @@ Observation (57 float32, all in [0, 1]):
   [54]       is_on_fire     (0 or 1)
   [55]       is_poisoned    (0 or 1)
   [56]       sky_visibility (1=surface, 0=deep underground)
+  [57]       portal distance   (1=no portal in 400px, 0=at portal)
+  [58]       portal dx_norm    (0.5=portal at same X; <0.5 left, >0.5 right)
+  [59]       portal dy_norm    (0.5=portal at same Y; <0.5 above, >0.5 below)
 
-Actions (Discrete 8):
+Actions (Discrete 10):
   0=idle  1=left  2=right  3=jump
   4=left+jump  5=right+jump  6=fire(auto-aim)  7=fire-down(dig)
+  8=kick(melee)  9=jetpack_hold(ascend, burns fuel)
 """
 
 from __future__ import annotations
@@ -50,9 +54,9 @@ class NoitaEnv(gym.Env):
         self.host = host
         self.port = port
 
-        self.action_space = gym.spaces.Discrete(8)
+        self.action_space = gym.spaces.Discrete(10)
         self.observation_space = gym.spaces.Box(
-            low=0.0, high=1.0, shape=(57,), dtype=np.float32
+            low=0.0, high=1.0, shape=(60,), dtype=np.float32
         )
 
         # WebSocket state (written by WS thread, read by main thread)
@@ -160,23 +164,9 @@ class NoitaEnv(gym.Env):
         return False
 
     def _obs_from_state(self, state: Optional[dict]) -> np.ndarray:
-        # Layout (57 total):
-        #  [0..15]   platform rays      (1=clear, 0=wall)
-        #  [16..23]  enemy radar        (1=none, 0=enemy at player)
-        #  [24..31]  liquid sensors     (0=dry, ~1=pool ahead)
-        #  [32..39]  projectile radar   (1=clear, 0=bullet at player)
-        #  [40..47]  gold radar         (1=no gold, 0=gold at player)
-        #  [48]      hp
-        #  [49]      vx normalised
-        #  [50]      vy normalised
-        #  [51]      on_ground
-        #  [52]      jetpack fuel
-        #  [53]      wand ready
-        #  [54]      is_on_fire
-        #  [55]      is_poisoned
-        #  [56]      sky_visibility
+        # See module docstring for the full 60-feature layout.
         if state is None:
-            return np.zeros(57, dtype=np.float32)
+            return np.zeros(60, dtype=np.float32)
 
         vx   = float(np.clip(state.get("vx", 0.0) / 200.0, -1.0, 1.0)) * 0.5 + 0.5
         vy   = float(np.clip(state.get("vy", 0.0) / 200.0, -1.0, 1.0)) * 0.5 + 0.5
@@ -198,10 +188,15 @@ class NoitaEnv(gym.Env):
         is_poisoned  = float(state.get("is_poisoned",   0.0))
         sky_vis      = float(state.get("sky_visibility", 0.0))
 
+        portal = state.get("portal", [1.0, 0.5, 0.5])
+        if not isinstance(portal, list) or len(portal) != 3:
+            portal = [1.0, 0.5, 0.5]
+
         return np.array(
             rays + enemies + liquids + projs + gold +
             [state.get("hp", 1.0), vx, vy, gnd, fuel, wand,
-             is_on_fire, is_poisoned, sky_vis],
+             is_on_fire, is_poisoned, sky_vis,
+             float(portal[0]), float(portal[1]), float(portal[2])],
             dtype=np.float32,
         )
 
@@ -273,6 +268,27 @@ class NoitaEnv(gym.Env):
         current_hp = state.get("hp", 0.0)
         dead       = state.get("dead", False)
 
+        # Portal teleport detection — sudden large Δposition between frames is a
+        # holy-mountain teleporter trigger (real walking caps at ~60 px/step).
+        # Guarded by "was near a portal last frame" so a WebSocket reconnect or
+        # Noita restart doesn't trigger a false +20.
+        portal_teleport_reward = 0.0
+        if prev_state is not None and not prev_state.get("dead", False):
+            prev_x = prev_state.get("x", current_x)
+            prev_y = prev_state.get("y", current_y)
+            prev_portal = prev_state.get("portal", [1.0, 0.5, 0.5])
+            was_near_portal = (
+                isinstance(prev_portal, list) and len(prev_portal) == 3
+                and float(prev_portal[0]) < 0.5
+            )
+            big_jump = abs(current_x - prev_x) > 300 or abs(current_y - prev_y) > 300
+            if big_jump and was_near_portal:
+                portal_teleport_reward = 20.0
+                logger.info(
+                    "[env:{}] Portal teleport detected (Δ=({:.0f},{:.0f})) → +20",
+                    self.port, current_x - prev_x, current_y - prev_y,
+                )
+
         # ── Reward ────────────────────────────────────────────────────────────
         # Design goal: reward ANY movement away from spawn, not just descent.
         # The old code only rewarded +Δy and punished standing still with -10,
@@ -288,11 +304,15 @@ class NoitaEnv(gym.Env):
         else:
             self.steps_without_progress += 1
 
-        # 2. Strong curiosity bonus for new 32×32 chunks
+        # 2. Strong curiosity bonus for new 32×32 chunks — but only underground.
+        # JETPACK_HOLD lets the agent fly to the ceiling; without this gate it would
+        # farm chunk reward by exploring the open surface biome.
         chunk = (int(current_x // 32), int(current_y // 32))
         if chunk not in self.visited_chunks:
             self.visited_chunks.add(chunk)
-            reward += 0.5
+            sky_vis = float(state.get("sky_visibility", 0.0))
+            if sky_vis < 0.3:
+                reward += 0.5
 
         # 3. Small additional bonus for new depth records (preserves "go down")
         if current_y > self.max_depth_y:
@@ -318,6 +338,23 @@ class NoitaEnv(gym.Env):
         if current_kills > self.last_kills:
             reward += (current_kills - self.last_kills) * 5.0
         self.last_kills = current_kills
+
+        # 5b. Aim-on-enemy bonus: small reward when FIRE pressed AND an enemy is in
+        # 250 px. Closes the gap between "I pulled the trigger" and the rare +5/kill.
+        # Capped below chunk reward so curiosity isn't overridden.
+        if int(action) in (6, 7):
+            enemy_radar = state.get("enemy_radar", [1.0] * 8)
+            if any(v < 0.9 for v in enemy_radar):
+                reward += 0.05
+
+        # 5c. Portal proximity bonus + one-shot teleport reward (Holy Mountain).
+        portal = state.get("portal", [1.0, 0.5, 0.5])
+        if isinstance(portal, list) and len(portal) == 3:
+            portal_dist = float(portal[0])
+            if portal_dist < 0.3:
+                # Smooth gradient pulling the agent into the portal.
+                reward += (0.3 - portal_dist) * 0.05
+        reward += portal_teleport_reward
 
         # 6. Death penalty — mild so the agent doesn't become risk-averse
         if dead and current_hp <= 0:

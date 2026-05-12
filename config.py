@@ -31,14 +31,14 @@ class Config(BaseSettings):
     resume_from: Optional[str] = None        # path to .zip checkpoint
 
     # PPO hyperparameters
-    learning_rate: float = Field(3e-4, gt=0)
-    n_steps: int         = Field(512, ge=64)     # was 2048 — tighter feedback at 1 env
-    batch_size: int      = Field(128, ge=16)
+    learning_rate: float = Field(1e-4, gt=0)
+    n_steps: int         = Field(1024, ge=64)    # more on-policy data per update
+    batch_size: int      = Field(256, ge=16)     # better GPU utilisation
     n_epochs: int        = Field(10, ge=1)
     gamma: float         = Field(0.99, ge=0, le=1)
     gae_lambda: float    = Field(0.95, ge=0, le=1)
     clip_range: float    = Field(0.2, gt=0, lt=1)
-    ent_coef: float      = Field(0.02, ge=0.0, le=1.0)   # was unset (SB3 default 0.0)
+    ent_coef: float      = Field(0.015, ge=0.0, le=1.0)  # slightly lower exploration noise
     vf_coef: float       = Field(0.5,  gt=0.0)
     max_grad_norm: float = Field(0.5,  gt=0.0)
 
