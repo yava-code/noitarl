@@ -33,6 +33,7 @@ import json
 import threading
 import time
 from typing import Any, Optional
+import collections
 from collections import Counter
 import io
 
@@ -88,9 +89,19 @@ class NoitaEnv(gym.Env):
         self.action_history: list[int] = []
 
         self.sct = mss.mss()
+        self.frame_buffer = collections.deque(maxlen=30)
+        self.gif_skip = 0
+
+        # Per-step event-detection state for VideoRecorder
+        self._fast_mv_counter = 0        # consecutive steps with |vx|>120
+        self._recorder = None            # injected via set_recorder()
 
         self._start_server()
-        logger.info("[env:{}] WebSocket server on {}:{}", port, host, port)
+        logger.info("[env:{}] WebSocket server on {}:{}", self.port, host, port)
+
+    def set_recorder(self, recorder) -> None:
+        """Inject VideoRecorder after construction (avoids circular import)."""
+        self._recorder = recorder
 
     # ── WebSocket server ──────────────────────────────────────────────────────
 
@@ -268,6 +279,26 @@ class NoitaEnv(gym.Env):
         current_hp = state.get("hp", 0.0)
         dead       = state.get("dead", False)
 
+        # Capture frames for end-of-episode GIF — Noita window, not whole monitor
+        self.gif_skip += 1
+        if self.gif_skip >= 2:  # every 2 steps ≈ 7.5 FPS
+            self.gif_skip = 0
+            try:
+                import pygetwindow as gw
+                wins = gw.getWindowsWithTitle("Noita")
+                if wins and wins[0].width > 50:
+                    w = wins[0]
+                    mon = {"top": max(0, w.top), "left": max(0, w.left),
+                           "width": w.width, "height": w.height}
+                    sct_img = self.sct.grab(mon)
+                else:
+                    sct_img = self.sct.grab(self.sct.monitors[1])
+                img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+                img.thumbnail((640, 360), Image.Resampling.LANCZOS)
+                self.frame_buffer.append(img)
+            except Exception:
+                pass
+
         # Portal teleport detection — sudden large Δposition between frames is a
         # holy-mountain teleporter trigger (real walking caps at ~60 px/step).
         # Guarded by "was near a portal last frame" so a WebSocket reconnect or
@@ -368,6 +399,52 @@ class NoitaEnv(gym.Env):
         self.route_y.append(current_y)
         self.action_history.append(int(action))
 
+        # ── Per-step VideoRecorder triggers ──────────────────────────────────
+        if self._recorder is not None:
+            rec = self._recorder
+            ctx_base = {
+                "dist":    self.max_spawn_distance,
+                "depth":   self.max_depth_y,
+                "kills":   current_kills,
+                "steps":   self.episode_steps,
+                "reward":  reward,
+                "episode": self.episode_num,
+                "chunks":  len(self.visited_chunks),
+            }
+
+            # 1. Portal teleport
+            if portal_teleport_reward > 0:
+                rec.trigger_event("portal_teleport", ctx_base)
+
+            # 2. Reward spike (portal or big chunk burst)
+            if reward > 15.0:
+                rec.trigger_event("reward_spike", {**ctx_base, "reward": reward})
+
+            # 3. Instant massive damage (HP drops ≥ 40% in one step)
+            if prev_state is not None and not dead:
+                prev_hp = prev_state.get("hp", 1.0)
+                hp_drop = prev_hp - current_hp
+                if hp_drop >= 0.40:
+                    rec.trigger_event("instant_damage", {**ctx_base, "damage": hp_drop})
+
+            # 4. Extreme fall (vy > 350 — free-falling into a pit)
+            current_vy = state.get("vy", 0.0)
+            if current_vy > 350:
+                rec.trigger_event("extreme_fall", {**ctx_base, "vy": current_vy})
+
+            # 5. Sustained fast horizontal movement (|vx| > 120 for 15 steps)
+            current_vx_raw = state.get("vx", 0.0)
+            if abs(current_vx_raw) > 120:
+                self._fast_mv_counter += 1
+                if self._fast_mv_counter == 15:   # trigger once per burst
+                    rec.trigger_event("fast_movement", {**ctx_base, "vx": current_vx_raw})
+            else:
+                self._fast_mv_counter = 0
+
+            # 6. Wand kill in this step
+            if current_kills > self.last_kills and int(action) in (6, 7):
+                rec.trigger_event("wand_kill", {**ctx_base, "kills": current_kills})
+
         visually_stuck = False
         action_loop = False
         if len(self.route_x) >= 200:
@@ -395,13 +472,34 @@ class NoitaEnv(gym.Env):
             
             screenshot_bytes = None
             try:
-                sct_img = self.sct.grab(self.sct.monitors[1])
+                import pygetwindow as gw
+                wins = gw.getWindowsWithTitle("Noita")
+                if wins and wins[0].width > 50:
+                    w = wins[0]
+                    mon = {"top": max(0, w.top), "left": max(0, w.left),
+                           "width": w.width, "height": w.height}
+                    sct_img = self.sct.grab(mon)
+                else:
+                    sct_img = self.sct.grab(self.sct.monitors[1])
                 img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
                 buf = io.BytesIO()
                 img.save(buf, format="PNG")
                 screenshot_bytes = buf.getvalue()
             except Exception as exc:
                 logger.debug("[env:{}] Screenshot failed: {}", self.port, exc)
+
+            gif_bytes = None
+            try:
+                if len(self.frame_buffer) > 5:
+                    import io
+                    buf = io.BytesIO()
+                    # frame_buffer is a deque of PIL images
+                    frames = list(self.frame_buffer)
+                    frames[0].save(buf, format="GIF", save_all=True, append_images=frames[1:], duration=100, loop=0)
+                    gif_bytes = buf.getvalue()
+                    self.frame_buffer.clear()
+            except Exception as exc:
+                logger.debug("[env:{}] GIF generation failed: {}", self.port, exc)
 
             run_time = time.time() - self.episode_start_time
             info = {
@@ -416,6 +514,7 @@ class NoitaEnv(gym.Env):
                 "noita/steps_without_progress": int(self.steps_without_progress),
                 "noita/death_reason":       reason,
                 "noita/screenshot":         screenshot_bytes,
+                "noita/gif_bytes":          gif_bytes,
                 "noita/route_x":            self.route_x,
                 "noita/route_y":            self.route_y,
                 "noita/visually_stuck":     visually_stuck,

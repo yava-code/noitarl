@@ -28,6 +28,7 @@ from callbacks import NoitaMonitorCallback
 from config import Config
 from noita_env import NoitaEnv
 from notify import TelegramNotifier
+from video_recorder import VideoRecorder
 
 
 def make_env(port: int):
@@ -57,12 +58,17 @@ def train(n_envs: int, base_port: int, total_steps: int, resume: str | None):
     notifier = TelegramNotifier(cfg.telegram_token, cfg.telegram_chat_id)
     notifier.start_polling()
 
+    recorder = VideoRecorder(notifier, groq_api_key=cfg.groq_api_key)
+    recorder.start()
+
     ports = [base_port + i for i in range(n_envs)]
     logger.info("Starting {} envs on ports {}", n_envs, ports)
 
     env = SubprocVecEnv([make_env(p) for p in ports])
+    # Note: SubprocVecEnv forks processes so set_recorder can't propagate.
+    # Per-step triggers come from callbacks instead (episode-level).
 
-    monitor_cb    = NoitaMonitorCallback(cfg, notifier)
+    monitor_cb    = NoitaMonitorCallback(cfg, notifier, recorder=recorder)
     checkpoint_cb = CheckpointCallback(
         save_freq   = max(cfg.checkpoint_freq // n_envs, 1),
         save_path   = cfg.checkpoint_dir,
@@ -108,6 +114,7 @@ def train(n_envs: int, base_port: int, total_steps: int, resume: str | None):
         notifier.send_text(f"💥 Multi-train crashed: {exc}")
         raise
     finally:
+        recorder.stop()
         out = os.path.join(cfg.checkpoint_dir, f"{run_name}_final")
         model.save(out)
         logger.info("Saved → {}.zip", out)

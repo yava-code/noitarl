@@ -46,12 +46,15 @@ class NoitaMonitorCallback(BaseCallback):
         cfg: Config,
         notifier: TelegramNotifier,
         verbose: int = 0,
+        recorder=None,
     ):
         super().__init__(verbose)
         self._cfg       = cfg
         self._tg        = notifier
+        self._recorder  = recorder    # VideoRecorder | None
         self._start_ts  = time.time()
         self._last_tg   = 0          # steps at last telegram send
+        self._muted     = False      # toggle periodic updates
         self._ep_rewards:   deque[float] = deque(maxlen=500)
         self._ep_depths:    deque[float] = deque(maxlen=500)
         self._ep_lengths:   deque[int]   = deque(maxlen=500)
@@ -59,6 +62,7 @@ class NoitaMonitorCallback(BaseCallback):
         self._ep_distances: deque[float] = deque(maxlen=500)
         self._total_episodes = 0
         self._stop_requested = False
+        self._paused = False
 
         self._consecutive_timeouts = 0
         self._best_spawn_distance = 0.0
@@ -79,12 +83,21 @@ class NoitaMonitorCallback(BaseCallback):
                     "total_damage", "run_time_s", "death_reason"
                 ])
 
+        # State capture for overlay
+        self._latest_overlay_stats = ""
+
         # Register Telegram commands
         notifier.register_stats_provider(self._stats_text)
-        notifier.register_command("stop",  self._cmd_stop)
-        notifier.register_command("plot",  self._cmd_plot)
-        notifier.register_command("best",  self._cmd_best)
-        notifier.register_command("help",  self._cmd_help)
+        notifier.register_command("checkpoint", self._cmd_checkpoint, "Download latest model (.zip)")
+        notifier.register_command("mute",       self._cmd_mute,       "Toggle periodic training updates")
+        notifier.register_command("pause",      self._cmd_pause,      "Pause Python training script")
+        notifier.register_command("lr",         self._cmd_lr,         "Change learning rate (e.g. /lr 0.0001)")
+        notifier.register_command("stop",       self._cmd_stop,       "Stop training gracefully")
+        notifier.register_command("plot",       self._cmd_plot,       "Send reward and episode length plot")
+        notifier.register_command("best",       self._cmd_best,       "Show best runs (Hall of Fame)")
+        notifier.register_command("sysinfo",    self._cmd_sysinfo,    "Show system CPU and RAM usage")
+        notifier.register_command("logs",    self._cmd_logs,    "Tail the latest run logs")
+        notifier.register_command("help",    self._cmd_help,    "Show help message")
 
     # ── SB3 lifecycle ─────────────────────────────────────────────────────────
 
@@ -95,14 +108,28 @@ class NoitaMonitorCallback(BaseCallback):
             f"Steps: {self._cfg.total_timesteps:,}\n"
             f"Envs: {self._cfg.n_envs}\n"
             f"LR: {self._cfg.learning_rate}\n"
-            f"Commands: /status /plot /stop"
+            f"Hint: Use the Menu button or keyboard below to interact."
         )
+
+        # Override default /screen to include overlay
+        def _screen():
+            png = self._tg.capture_noita_screen(overlay_text=self._latest_overlay_stats)
+            if png:
+                self._tg.send_photo(png, caption="📸 Capture from Noita window")
+            else:
+                self._tg.send_text("⚠️ Could not capture Noita window. Is the game running?")
+        self._tg.register_command("screen", _screen, "Capture Noita game screenshot with stats")
 
     def _on_step(self) -> bool:
         if self._stop_requested:
             logger.warning("Stop requested via Telegram — ending training")
             self._tg.send_text("⛔ Training stopped on your request.")
             return False  # signals SB3 to stop
+
+        while self._paused:
+            time.sleep(1.0)
+            if self._stop_requested:
+                return False
 
         infos = self.locals.get("infos", [])
         for info in infos:
@@ -122,6 +149,7 @@ class NoitaMonitorCallback(BaseCallback):
             death_reason = info.get("noita/death_reason", "UNKNOWN")
             
             screenshot = info.get("noita/screenshot")
+            gif_bytes = info.get("noita/gif_bytes")
             route_x = info.get("noita/route_x", [])
             route_y = info.get("noita/route_y", [])
             visually_stuck = info.get("noita/visually_stuck", False)
@@ -131,6 +159,7 @@ class NoitaMonitorCallback(BaseCallback):
             self._ep_lengths.append(l)
             self._ep_chunks.append(chunks)
             self._ep_distances.append(dist)
+            self._ep_depths.append(depth)
             self._total_episodes += 1
             self._current_ep_start_step = self.num_timesteps
 
@@ -159,12 +188,60 @@ class NoitaMonitorCallback(BaseCallback):
             if dist > self._best_spawn_distance:
                 self._best_spawn_distance = dist
                 self._on_new_record(dist, depth, kills, route_x, route_y, postcard)
+                # Send GIF if available on new record
+                if gif_bytes:
+                    try:
+                        # save locally first for hall of fame
+                        gif_path = f"data/hall_of_fame/run_{int(dist)}px_ep{self._total_episodes}.gif"
+                        with open(gif_path, "wb") as f:
+                            f.write(gif_bytes)
+                        self._tg.send_document(gif_path, caption=f"🎥 <b>Record Replay</b> ({dist:.0f}px)")
+                    except Exception as e:
+                        logger.error("Failed to process replay GIF: {}", e)
 
             # Check alerts
             if visually_stuck:
                 self._tg.send_photo(postcard, caption="⚠️ <b>Agent is visually stuck!</b>\nCoordinates barely changed for 200 steps.")
             if action_loop:
                 self._tg.send_photo(postcard, caption="⚠️ <b>Agent in action loop!</b>\nDoing the same action for >80% of the last 500 steps.")
+
+            # ── Episode-level VideoRecorder triggers ──────────────────────────
+            if self._recorder is not None:
+                rec = self._recorder
+                ctx = {
+                    "dist":    dist,
+                    "depth":   depth,
+                    "kills":   kills,
+                    "steps":   l,
+                    "reward":  r,
+                    "episode": self._total_episodes,
+                    "chunks":  chunks,
+                }
+                # New distance record
+                if dist > self._best_spawn_distance:
+                    rec.trigger_event("new_distance_record", ctx)
+                # New depth record (simple check — compare to last 5 ep max)
+                if len(self._ep_depths) == 0 or depth > max(list(self._ep_depths)[-5:] or [0]):
+                    if depth > 500:   # only meaningful depth
+                        rec.trigger_event("new_depth_record", ctx)
+                # Kill spree
+                if kills >= 3:
+                    rec.trigger_event("kill_spree", ctx)
+                # Death after long run
+                if death_reason == "DEAD" and l >= 300:
+                    rec.trigger_event("death_long_run", ctx)
+                # Visually stuck
+                if visually_stuck:
+                    rec.trigger_event("visually_stuck", ctx)
+                # Action loop
+                if action_loop:
+                    rec.trigger_event("action_loop", ctx)
+                # Long survival milestone
+                if l >= 600 and death_reason != "DEAD":
+                    rec.trigger_event("long_survival", ctx)
+                # High episode reward
+                if r > 100.0:
+                    rec.trigger_event("high_episode_reward", ctx)
 
             if self._consecutive_timeouts >= 5:
                 self._tg.send_text("⚠️ <b>Agent stuck!</b>\n5 consecutive timeouts without progress.")
@@ -202,7 +279,8 @@ class NoitaMonitorCallback(BaseCallback):
         steps_since = self.num_timesteps - self._last_tg
         if steps_since >= self._cfg.telegram_notify_every:
             self._last_tg = self.num_timesteps
-            self._send_tg_update()
+            if not self._muted:
+                self._send_tg_update()
 
         return True
 
@@ -368,12 +446,107 @@ class NoitaMonitorCallback(BaseCallback):
         
         self._tg.send_photo(best_png, caption=f"🌟 <b>Hall of Fame (Top 5)</b>\n\n{top_list}")
 
+    def _cmd_sysinfo(self) -> None:
+        try:
+            import psutil
+            process = psutil.Process(os.getpid())
+            ram_mb = process.memory_info().rss / 1024 / 1024
+            cpu_pct = process.cpu_percent(interval=0.2)
+            sys_ram = psutil.virtual_memory()
+            sys_cpu = psutil.cpu_percent(interval=0.2)
+
+            bar_cpu = "█" * int(sys_cpu / 10) + "░" * (10 - int(sys_cpu / 10))
+            bar_ram = "█" * int(sys_ram.percent / 10) + "░" * (10 - int(sys_ram.percent / 10))
+
+            text = (
+                f"🖥 <b>System Info</b>\n\n"
+                f"<b>Global OS:</b>\n"
+                f"CPU: [{bar_cpu}] {sys_cpu}%\n"
+                f"RAM: [{bar_ram}] {sys_ram.percent}%\n\n"
+                f"<b>Agent Process:</b>\n"
+                f"CPU: {cpu_pct}%\n"
+                f"RAM: {ram_mb:.0f} MB"
+            )
+            self._tg.send_text(text)
+        except Exception as e:
+            self._tg.send_text(f"⚠️ Failed to get system info: {e}")
+
+    def _cmd_logs(self) -> None:
+        try:
+            log_files = glob.glob(os.path.join(self._cfg.log_dir, "*.log"))
+            if not log_files:
+                self._tg.send_text("⚠️ No log files found.")
+                return
+            
+            latest_log = max(log_files, key=os.path.getmtime)
+            
+            with open(latest_log, "r", encoding="utf-8") as f:
+                # Read last ~20 lines quickly
+                f.seek(0, os.SEEK_END)
+                file_size = f.tell()
+                f.seek(max(file_size - 4000, 0), os.SEEK_SET) # Read last 4KB
+                lines = f.readlines()
+                
+            last_lines = "".join(lines[-20:])
+            self._tg.send_text(f"📄 <b>Latest Logs:</b> <code>{os.path.basename(latest_log)}</code>\n\n<pre>{last_lines}</pre>")
+        except Exception as e:
+            self._tg.send_text(f"⚠️ Failed to read logs: {e}")
+
     def _cmd_help(self) -> None:
         self._tg.send_text(
             "🤖 <b>NoitaRL Bot commands</b>\n"
             "/status — current training stats\n"
             "/plot   — send reward graph\n"
             "/best   — show hall of fame\n"
+            "/screen — capture Noita window screenshot\n"
+            "/sysinfo — show system CPU and RAM usage\n"
+            "/logs   — tail the latest run logs\n"
+            "/checkpoint — download latest model .zip\n"
+            "/mute   — toggle periodic updates\n"
             "/stop   — stop training gracefully\n"
             "/help   — this message"
         )
+
+    def _cmd_checkpoint(self) -> None:
+        try:
+            zips = glob.glob(os.path.join(self._cfg.checkpoint_dir, "*.zip"))
+            if not zips:
+                self._tg.send_text("⚠️ No checkpoints found.")
+                return
+            latest_zip = max(zips, key=os.path.getmtime)
+            size_mb = os.path.getsize(latest_zip) / (1024 * 1024)
+            self._tg.send_document(
+                latest_zip,
+                caption=f"📦 <b>Latest Checkpoint</b>\n{os.path.basename(latest_zip)} ({size_mb:.1f} MB)"
+            )
+        except Exception as e:
+            self._tg.send_text(f"⚠️ Failed to send checkpoint: {e}")
+
+    def _cmd_mute(self) -> None:
+        self._muted = not self._muted
+        if self._muted:
+            self._tg.send_text("🔕 <b>Muted</b>\nPeriodic progress updates paused. Use /status to check manually.")
+        else:
+            self._tg.send_text("🔔 <b>Unmuted</b>\nPeriodic progress updates resumed.")
+
+    def _cmd_pause(self) -> None:
+        self._paused = not self._paused
+        if self._paused:
+            self._tg.send_text("⏸ <b>Training Paused</b>\nPython bridge stopped. Noita physics will run idle. Press ESC in Noita to pause the engine. Use /pause again to resume.")
+        else:
+            self._tg.send_text("▶️ <b>Training Resumed</b>")
+
+    def _cmd_lr(self, text: str) -> None:
+        try:
+            parts = text.split()
+            if len(parts) < 2:
+                raise ValueError("Missing value")
+            val = float(parts[1])
+            if hasattr(self.model, "policy") and hasattr(self.model.policy, "optimizer"):
+                for param_group in self.model.policy.optimizer.param_groups:
+                    param_group['lr'] = val
+            self.model.learning_rate = val
+            self._tg.send_text(f"✅ Learning rate changed to <b>{val}</b>")
+            logger.info("Learning rate changed to {}", val)
+        except Exception:
+            self._tg.send_text("⚠️ Usage: <code>/lr 0.0001</code>")

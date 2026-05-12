@@ -56,6 +56,9 @@ class Config(BaseSettings):
     telegram_chat_id: str  = ""
     telegram_notify_every: int = Field(100_000, ge=1_000)
 
+    # ── Groq (AI captions for video highlights) ───────────────────────────────
+    groq_api_key: str = ""   # set GROQ_API_KEY env var or in .env file
+
     @property
     def telegram_enabled(self) -> bool:
         return bool(self.telegram_token and self.telegram_chat_id)

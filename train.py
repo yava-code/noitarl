@@ -28,6 +28,7 @@ from callbacks import NoitaMonitorCallback
 from config import Config
 from noita_env import NoitaEnv
 from notify import TelegramNotifier
+from video_recorder import VideoRecorder
 
 console = Console()
 
@@ -115,9 +116,14 @@ def train(args: argparse.Namespace) -> None:
     notifier = TelegramNotifier(cfg.telegram_token, cfg.telegram_chat_id)
     notifier.start_polling()
 
+    # ── Video recorder ────────────────────────────────────────────────────────
+    recorder = VideoRecorder(notifier, groq_api_key=cfg.groq_api_key)
+    recorder.start()
+
     # ── Environment ───────────────────────────────────────────────────────────
     logger.info("Creating NoitaEnv on port {}", cfg.noita_base_port)
     env = NoitaEnv(host=cfg.noita_host, port=cfg.noita_base_port)
+    env.set_recorder(recorder)
 
     # ── Model ─────────────────────────────────────────────────────────────────
     if cfg.resume_from:
@@ -160,7 +166,7 @@ def train(args: argparse.Namespace) -> None:
         )
 
     # ── Callbacks ─────────────────────────────────────────────────────────────
-    monitor_cb = NoitaMonitorCallback(cfg, notifier, verbose=0)
+    monitor_cb = NoitaMonitorCallback(cfg, notifier, verbose=0, recorder=recorder)
 
     checkpoint_cb = CheckpointCallback(
         save_freq   = max(cfg.checkpoint_freq // 1, 1),
@@ -196,6 +202,7 @@ def train(args: argparse.Namespace) -> None:
         notifier.send_text(f"💥 <b>Training crashed!</b>\n{exc}")
         raise
     finally:
+        recorder.stop()
         out = os.path.join(cfg.checkpoint_dir, f"{run_name}_final")
         model.save(out)
         logger.info("Model saved → {}.zip", out)

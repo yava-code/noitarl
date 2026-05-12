@@ -32,22 +32,42 @@ class TelegramNotifier:
         self._offset   = 0
         self._running  = False
         self._handlers: dict[str, Callable] = {}
+        self._commands_desc: list[dict] = []
         self._stats_fn: Optional[Callable[[], str]] = None  # injected by callback
+        self._buttons_row_1 = [
+            {"text": "📊 Status", "callback_data": "status"},
+            {"text": "📈 Plot", "callback_data": "plot"},
+            {"text": "📸 Screen", "callback_data": "screen"}
+        ]
+        self._buttons_row_2 = [
+            {"text": "🏆 Best", "callback_data": "best"},
+            {"text": "🖥 SysInfo", "callback_data": "sysinfo"},
+            {"text": "📄 Logs", "callback_data": "logs"}
+        ]
+        self._buttons_row_3 = [
+            {"text": "📦 Model", "callback_data": "checkpoint"},
+            {"text": "🔕 Mute", "callback_data": "mute"},
+            {"text": "⏹ Stop", "callback_data": "stop"}
+        ]
 
         if self._enabled:
             logger.info("Telegram notifier initialised (chat_id={})", chat_id)
 
     # ── Sending ───────────────────────────────────────────────────────────────
 
-    def send_text(self, text: str, parse_mode: str = "HTML") -> bool:
+    def send_text(self, text: str, parse_mode: str = "HTML", reply_markup: Optional[dict] = None) -> bool:
         if not self._enabled:
             return False
         try:
-            r = requests.post(
-                f"{self._base}/sendMessage",
-                json={"chat_id": self._chat_id, "text": text, "parse_mode": parse_mode},
-                timeout=10,
-            )
+            payload = {"chat_id": self._chat_id, "text": text, "parse_mode": parse_mode}
+            if reply_markup:
+                payload["reply_markup"] = reply_markup
+            else:
+                # Add default keyboard
+                payload["reply_markup"] = {
+                    "inline_keyboard": [self._buttons_row_1, self._buttons_row_2, self._buttons_row_3]
+                }
+            r = requests.post(f"{self._base}/sendMessage", json=payload, timeout=10)
             if r.status_code != 200:
                 logger.warning("Telegram sendMessage returned {}: {}", r.status_code, r.text[:200])
             return r.status_code == 200
@@ -55,14 +75,63 @@ class TelegramNotifier:
             logger.warning("Telegram send_text failed: {}", exc)
             return False
 
-    def send_photo(self, png_bytes: bytes, caption: str = "") -> bool:
+    def send_animation(self, gif_bytes: bytes, caption: str = "") -> bool:
+        """Send GIF as inline animation (loops in Telegram chat)."""
         if not self._enabled:
             return False
         try:
+            data = {"chat_id": self._chat_id, "caption": caption, "parse_mode": "HTML"}
+            r = requests.post(
+                f"{self._base}/sendAnimation",
+                files={"animation": ("highlight.gif", gif_bytes, "image/gif")},
+                data=data,
+                timeout=60,
+            )
+            if r.status_code != 200:
+                logger.warning("Telegram sendAnimation returned {}: {}", r.status_code, r.text[:200])
+            return r.status_code == 200
+        except Exception as exc:
+            logger.warning("Telegram send_animation failed: {}", exc)
+            return False
+
+    def send_document(self, file_path: str, caption: str = "", reply_markup: Optional[dict] = None) -> bool:
+        if not self._enabled:
+            return False
+        try:
+            data = {"chat_id": self._chat_id, "caption": caption}
+            if reply_markup is None:
+                data["reply_markup"] = '{"inline_keyboard": [[{"text": "📊 Status", "callback_data": "status"}, {"text": "📈 Plot", "callback_data": "plot"}, {"text": "📸 Screen", "callback_data": "screen"}], [{"text": "🏆 Best", "callback_data": "best"}, {"text": "🖥 SysInfo", "callback_data": "sysinfo"}, {"text": "📄 Logs", "callback_data": "logs"}], [{"text": "📦 Model", "callback_data": "checkpoint"}, {"text": "🔕 Mute", "callback_data": "mute"}, {"text": "⏹ Stop", "callback_data": "stop"}]]}'
+            elif reply_markup:
+                import json
+                data["reply_markup"] = json.dumps(reply_markup)
+
+            with open(file_path, "rb") as f:
+                r = requests.post(
+                    f"{self._base}/sendDocument",
+                    data=data,
+                    files={"document": f},
+                    timeout=60,
+                )
+            return r.status_code == 200
+        except Exception as exc:
+            logger.warning("Telegram send_document failed: {}", exc)
+            return False
+
+    def send_photo(self, png_bytes: bytes, caption: str = "", reply_markup: Optional[dict] = None) -> bool:
+        if not self._enabled:
+            return False
+        try:
+            data = {"chat_id": self._chat_id, "caption": caption}
+            if reply_markup is None:
+                data["reply_markup"] = '{"inline_keyboard": [[{"text": "📊 Status", "callback_data": "status"}, {"text": "📈 Plot", "callback_data": "plot"}, {"text": "📸 Screen", "callback_data": "screen"}], [{"text": "🏆 Best", "callback_data": "best"}, {"text": "🖥 SysInfo", "callback_data": "sysinfo"}, {"text": "📄 Logs", "callback_data": "logs"}], [{"text": "📦 Model", "callback_data": "checkpoint"}, {"text": "🔕 Mute", "callback_data": "mute"}, {"text": "⏹ Stop", "callback_data": "stop"}]]}'
+            elif reply_markup:
+                import json
+                data["reply_markup"] = json.dumps(reply_markup)
+
             r = requests.post(
                 f"{self._base}/sendPhoto",
                 files={"photo": ("plot.png", png_bytes, "image/png")},
-                data={"chat_id": self._chat_id, "caption": caption},
+                data=data,
                 timeout=20,
             )
             return r.status_code == 200
@@ -140,25 +209,98 @@ class TelegramNotifier:
 
     # ── Command bot ───────────────────────────────────────────────────────────
 
-    def register_command(self, command: str, handler: Callable) -> None:
-        """Register a callable to be invoked when /command is received."""
+    def register_command(self, command: str, handler: Callable, description: str = "") -> None:
+        """Register a callable to be invoked when /command is received. Handler takes (text: str) or ()"""
         self._handlers[f"/{command}"] = handler
+        if description:
+            self._commands_desc.append({"command": command, "description": description})
 
     def register_stats_provider(self, fn: Callable[[], str]) -> None:
         """fn() should return a formatted string of current training stats."""
         self._stats_fn = fn
+
+    def capture_noita_screen(self, overlay_text: str = "") -> bytes:
+        import io
+        try:
+            import pygetwindow as gw
+            import mss
+            from PIL import Image
+            
+            windows = gw.getWindowsWithTitle("Noita")
+            if not windows:
+                return b""
+            
+            win = windows[0]
+            with mss.mss() as sct:
+                monitor = {"top": win.top, "left": win.left, "width": win.width, "height": win.height}
+                sct_img = sct.grab(monitor)
+                img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+                
+                if overlay_text:
+                    draw = ImageDraw.Draw(img)
+                    try:
+                        font = ImageFont.truetype("arial.ttf", 24)
+                    except IOError:
+                        font = ImageFont.load_default()
+                    
+                    # Draw background box for readability
+                    text_bbox = draw.textbbox((10, 10), overlay_text, font=font)
+                    draw.rectangle([text_bbox[0]-5, text_bbox[1]-5, text_bbox[2]+5, text_bbox[3]+5], fill=(0, 0, 0, 150))
+                    draw.text((10, 10), overlay_text, fill=(0, 255, 0), font=font)
+
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+                return buf.getvalue()
+        except Exception as e:
+            logger.error("Failed to capture screen: {}", e)
+            return b""
+
+    def _answer_callback_query(self, callback_query_id: str, text: str = ""):
+        try:
+            requests.post(
+                f"{self._base}/answerCallbackQuery",
+                json={"callback_query_id": callback_query_id, "text": text, "show_alert": False},
+                timeout=5
+            )
+        except Exception:
+            pass
+
+    def setup_bot_menu(self) -> None:
+        if not self._enabled or not self._commands_desc:
+            return
+        try:
+            requests.post(
+                f"{self._base}/setMyCommands",
+                json={"commands": self._commands_desc},
+                timeout=10
+            )
+            logger.info("Telegram bot menu commands updated")
+        except Exception as e:
+            logger.warning("Failed to set bot menu: {}", e)
 
     def start_polling(self) -> None:
         if not self._enabled:
             return
         self._running = True
 
-        # Register built-in /status command
+        # Register built-in commands
         if "/status" not in self._handlers:
             def _status():
                 text = self._stats_fn() if self._stats_fn else "No stats available yet."
                 self.send_text(f"📊 <b>Status</b>\n{text}")
-            self._handlers["/status"] = _status
+            self.register_command("status", _status, "Training statistics")
+
+        if "/screen" not in self._handlers:
+            def _screen():
+                png = self.capture_noita_screen()
+                if png:
+                    self.send_photo(png, caption="📸 Capture from Noita window")
+                else:
+                    self.send_text("⚠️ Could not capture Noita window. Is the game running?")
+            self.register_command("screen", _screen, "Capture Noita game screenshot")
+
+        # Sync menu to Telegram
+        self.setup_bot_menu()
 
         t = threading.Thread(target=self._poll_loop, daemon=True, name="telegram-poll")
         t.start()
@@ -177,13 +319,42 @@ class TelegramNotifier:
                 ).json()
                 for update in resp.get("result", []):
                     self._offset = update["update_id"] + 1
-                    text = update.get("message", {}).get("text", "").strip()
-                    handler = self._handlers.get(text)
-                    if handler:
-                        try:
-                            handler()
-                        except Exception as exc:
-                            logger.warning("Telegram handler '{}' raised: {}", text, exc)
+                    
+                    # Handle message commands
+                    if "message" in update:
+                        text = update["message"].get("text", "").strip()
+                        
+                        # Find matching command (allows arguments, e.g. /lr 0.0001)
+                        for cmd_str, handler in self._handlers.items():
+                            if text.startswith(cmd_str):
+                                try:
+                                    import inspect
+                                    sig = inspect.signature(handler)
+                                    if len(sig.parameters) > 0:
+                                        handler(text)
+                                    else:
+                                        handler()
+                                except Exception as exc:
+                                    logger.warning("Telegram handler '{}' raised: {}", text, exc)
+                                break
+
+                    # Handle callback queries (inline buttons)
+                    elif "callback_query" in update:
+                        cq = update["callback_query"]
+                        cq_id = cq["id"]
+                        data = cq.get("data", "")
+                        
+                        cmd = f"/{data}"
+                        handler = self._handlers.get(cmd)
+                        if handler:
+                            try:
+                                handler()
+                                self._answer_callback_query(cq_id, "Action completed")
+                            except Exception as exc:
+                                logger.warning("Telegram callback handler '{}' raised: {}", data, exc)
+                                self._answer_callback_query(cq_id, "Error executing action")
+                        else:
+                            self._answer_callback_query(cq_id)
             except Exception as exc:
                 logger.debug("Telegram poll error (will retry): {}", exc)
             time.sleep(2)
