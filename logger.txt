@@ -4233,3 +4233,5 @@
 [19:48:09] [INFO ] DIAG ep=140 step=496 pos=(321,-114) vel=(51.0,223.5) vhp=4.00 gnd=false act=R+JMP fps=58
 [19:48:15] [INFO ] DIAG ep=140 step=571 pos=(299,-220) vel=(0.0,-194.2) vhp=4.00 gnd=false act=JETPK fps=60
 [19:48:20] [INFO ] DIAG ep=140 step=646 pos=(296,-221) vel=(0.0,22.8) vhp=4.00 gnd=false act=JETPK fps=58
+[19:48:25] [INFO ] DIAG ep=140 step=721 pos=(302,-322) vel=(0.0,156.2) vhp=4.00 gnd=false act=JUMP fps=60
+[19:48:30] [INFO ] DIAG ep=140 step=796 pos=(359,-130) vel=(51.0,86.5) vhp=4.00 gnd=false act=R+JMP fps=59
