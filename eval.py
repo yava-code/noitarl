@@ -46,6 +46,9 @@ def evaluate(model_path: str, n_episodes: int, port: int, step_delay: float) -> 
     ep_rewards = []
     ep_lengths = []
     ep_depths  = []
+    
+    best_ep_reward = -float('inf')
+    best_ep_stats = {}
 
     for ep in range(1, n_episodes + 1):
         obs, _ = env.reset()
@@ -66,6 +69,18 @@ def evaluate(model_path: str, n_episodes: int, port: int, step_delay: float) -> 
         ep_depths.append(env.max_depth_y)
         logger.info("Ep {:3d}: reward={:8.2f}  steps={:5d}  max_depth={:.0f}",
                     ep, total_r, steps, env.max_depth_y)
+                    
+        if total_r > best_ep_reward:
+            best_ep_reward = total_r
+            best_ep_stats = {
+                "ep": ep,
+                "reward": total_r,
+                "steps": steps,
+                "max_depth": env.max_depth_y,
+                "max_x": env.max_x,
+                "kills": env.last_kills,
+                "damage_taken": env.total_damage
+            }
 
     # Summary table
     import numpy as np
@@ -79,6 +94,17 @@ def evaluate(model_path: str, n_episodes: int, port: int, step_delay: float) -> 
         a = np.array(vals, dtype=float)
         t.add_row(label, f"{a.mean():.2f}", f"{a.std():.2f}", f"{a.min():.2f}", f"{a.max():.2f}")
     console.print(t)
+
+    if best_ep_stats:
+        console.rule("[bold magenta]Best Episode Record")
+        console.print(f"  Episode: [magenta]{best_ep_stats['ep']}[/]")
+        console.print(f"  Reward:  [magenta]{best_ep_stats['reward']:.2f}[/]")
+        console.print(f"  Steps:   [magenta]{best_ep_stats['steps']}[/]")
+        console.print(f"  Depth:   [magenta]{best_ep_stats['max_depth']:.0f}[/]")
+        console.print(f"  Max X:   [magenta]{best_ep_stats['max_x']:.0f}[/]")
+        console.print(f"  Kills:   [magenta]{best_ep_stats['kills']}[/]")
+        console.print(f"  Damage:  [magenta]{best_ep_stats['damage_taken']:.0f}[/]")
+        console.rule()
 
 
 def parse_args() -> argparse.Namespace:

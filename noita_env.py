@@ -69,6 +69,9 @@ class NoitaEnv(gym.Env):
         self.spawn_x             = 0.0
         self.spawn_y             = 0.0
         self.max_spawn_distance  = 0.0
+        self.max_x               = 0.0
+        self.total_damage        = 0.0
+        self.episode_start_time  = time.time()
         self.steps_without_progress = 0
         self.visited_chunks: set = set()
 
@@ -204,6 +207,9 @@ class NoitaEnv(gym.Env):
         self.last_gold               = 0
         self.last_kills              = 0
         self.max_spawn_distance      = 0.0
+        self.max_x                   = 0.0
+        self.total_damage            = 0.0
+        self.episode_start_time      = time.time()
         self.steps_without_progress  = 0
         self.visited_chunks          = set()
 
@@ -219,6 +225,7 @@ class NoitaEnv(gym.Env):
             self.last_x      = s.get("x", 0.0)
             self.spawn_x     = s.get("x", 0.0)
             self.spawn_y     = s.get("y", 0.0)
+            self.max_x       = self.spawn_x
             self.last_gold   = s.get("gold",  0)
             self.last_kills  = s.get("kills", 0)
 
@@ -288,7 +295,11 @@ class NoitaEnv(gym.Env):
 
         # 5. Damage / kills (kept, milder)
         if current_hp < self.last_hp:
-            reward -= (self.last_hp - current_hp) * 1.0
+            damage = self.last_hp - current_hp
+            reward -= damage * 1.0
+            self.total_damage += damage
+
+        self.max_x = max(self.max_x, current_x)
 
         current_kills = state.get("kills", 0)
         if current_kills > self.last_kills:
@@ -304,19 +315,27 @@ class NoitaEnv(gym.Env):
         self.episode_reward += reward
 
         if dead or truncated:
+            reason = "TRUNC" if truncated and not dead else "DEAD"
             logger.info(
                 "[env:{}] Ep {:3d} done — steps={} reward={:.2f} "
                 "max_dist={:.0f} max_depth={:.0f} chunks={} ({})",
                 self.port, self.episode_num, self.episode_steps,
                 self.episode_reward, self.max_spawn_distance,
                 self.max_depth_y, len(self.visited_chunks),
-                "TRUNC" if truncated and not dead else "DEAD",
+                reason,
             )
+            run_time = time.time() - self.episode_start_time
             info = {
                 "episode": {"r": self.episode_reward, "l": self.episode_steps},
                 "noita/visited_chunks":     len(self.visited_chunks),
                 "noita/max_spawn_distance": float(self.max_spawn_distance),
                 "noita/max_depth":          float(self.max_depth_y),
+                "noita/max_x":              float(self.max_x),
+                "noita/kills":              int(self.last_kills),
+                "noita/total_damage":       float(self.total_damage),
+                "noita/run_time_s":         float(run_time),
+                "noita/steps_without_progress": int(self.steps_without_progress),
+                "noita/death_reason":       reason,
             }
             with self._lock:
                 self._state = None   # force reset() to wait for fresh state

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import time
+import csv
 from collections import deque
 from typing import Optional
 
@@ -58,6 +59,24 @@ class NoitaMonitorCallback(BaseCallback):
         self._total_episodes = 0
         self._stop_requested = False
 
+        self._consecutive_timeouts = 0
+        self._best_spawn_distance = 0.0
+        self._session_deaths = 0
+        self._session_timeouts = 0
+        self._session_kills = 0
+        self._current_ep_start_step = 0
+
+        os.makedirs("data", exist_ok=True)
+        self._csv_path = "data/episode_history.csv"
+        if not os.path.exists(self._csv_path):
+            with open(self._csv_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "global_step", "episode", "reward", "length", "visited_chunks",
+                    "max_spawn_distance", "max_depth", "max_x", "kills", 
+                    "total_damage", "run_time_s", "death_reason"
+                ])
+
         # Register Telegram commands
         notifier.register_stats_provider(self._stats_text)
         notifier.register_command("stop",  self._cmd_stop)
@@ -82,7 +101,6 @@ class NoitaMonitorCallback(BaseCallback):
             self._tg.send_text("⛔ Training stopped on your request.")
             return False  # signals SB3 to stop
 
-        # Harvest completed episode info from SB3's internal buffer
         infos = self.locals.get("infos", [])
         for info in infos:
             ep = info.get("episode")
@@ -93,22 +111,56 @@ class NoitaMonitorCallback(BaseCallback):
             chunks = int(info.get("noita/visited_chunks", 0))
             dist   = float(info.get("noita/max_spawn_distance", 0.0))
             depth  = float(info.get("noita/max_depth", 0.0))
+
+            max_x = float(info.get("noita/max_x", 0.0))
+            kills = int(info.get("noita/kills", 0))
+            total_damage = float(info.get("noita/total_damage", 0.0))
+            run_time = float(info.get("noita/run_time_s", 0.0))
+            death_reason = info.get("noita/death_reason", "UNKNOWN")
+
             self._ep_rewards.append(r)
             self._ep_lengths.append(l)
             self._ep_chunks.append(chunks)
             self._ep_distances.append(dist)
             self._total_episodes += 1
+            self._current_ep_start_step = self.num_timesteps
+
+            self._session_kills += kills
+            if death_reason == "DEAD":
+                self._session_deaths += 1
+                self._consecutive_timeouts = 0
+            elif death_reason == "TRUNC":
+                self._session_timeouts += 1
+                self._consecutive_timeouts += 1
+
+            with open(self._csv_path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    self.num_timesteps, self._total_episodes, r, l, chunks,
+                    dist, depth, max_x, kills, total_damage, run_time, death_reason
+                ])
+
+            if dist > self._best_spawn_distance:
+                self._best_spawn_distance = dist
+                self._on_new_record(dist, depth, kills)
+
+            if self._consecutive_timeouts >= 5:
+                self._tg.send_text("⚠️ <b>Agent stuck!</b>\n5 consecutive timeouts without progress.")
+                self._consecutive_timeouts = 0
 
             # Log every episode to loguru
             logger.debug(
-                "ep={} reward={:.2f} length={} chunks={} dist={:.0f} steps={}",
-                self._total_episodes, r, l, chunks, dist, self.num_timesteps,
+                "ep={} reward={:.2f} length={} chunks={} dist={:.0f} depth={:.0f} kills={} reason={} steps={}",
+                self._total_episodes, r, l, chunks, dist, depth, kills, death_reason, self.num_timesteps,
             )
 
             # Surface in SB3's "rollout/" namespace for TensorBoard
             self.logger.record("noita/visited_chunks",     chunks)
             self.logger.record("noita/max_spawn_distance", dist)
             self.logger.record("noita/max_depth",          depth)
+            self.logger.record("noita/max_x",              max_x)
+            self.logger.record("noita/kills",              kills)
+            self.logger.record("noita/total_damage",       total_damage)
 
             # W&B per-episode
             if self._cfg.wandb_enabled and _WANDB_OK:
@@ -118,6 +170,9 @@ class NoitaMonitorCallback(BaseCallback):
                     "episode/visited_chunks": chunks,
                     "episode/spawn_distance": dist,
                     "episode/max_depth":      depth,
+                    "episode/kills":          kills,
+                    "episode/total_damage":   total_damage,
+                    "episode/run_time_s":     run_time,
                     "episode/total":          self._total_episodes,
                 }, step=self.num_timesteps)
 
@@ -171,6 +226,18 @@ class NoitaMonitorCallback(BaseCallback):
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
+    def _on_new_record(self, dist: float, depth: float, kills: int) -> None:
+        logger.info("🏆 New Record! Distance: {:.0f} | Depth: {:.0f} | Kills: {}", dist, depth, kills)
+        self._tg.send_text(
+            f"🏆 <b>New Record Run!</b>\n"
+            f"Max Spawn Distance: {dist:.0f} px\n"
+            f"Max Depth: {depth:.0f} px\n"
+            f"Kills: {kills}"
+        )
+        # Placeholder for OBS WebSocket integration
+        # if OBS_ENABLED:
+        #     trigger_obs_save_replay()
+
     def _stats_text(self) -> str:
         elapsed = time.time() - self._start_ts
         pct = self.num_timesteps / max(self._cfg.total_timesteps, 1) * 100
@@ -179,13 +246,19 @@ class NoitaMonitorCallback(BaseCallback):
         mean_c = float(np.mean(self._ep_chunks))    if self._ep_chunks    else 0.0
         mean_d = float(np.mean(self._ep_distances)) if self._ep_distances else 0.0
         sps = self.num_timesteps / max(elapsed, 1)
+        
+        current_ep_length = self.num_timesteps - self._current_ep_start_step
+        
         return (
             f"Steps: {self.num_timesteps:,} / {self._cfg.total_timesteps:,} ({pct:.1f}%)\n"
             f"Episodes: {self._total_episodes:,}\n"
+            f"Current Ep Steps: {current_ep_length:,}\n"
             f"Mean reward: {mean_r:.2f}\n"
             f"Mean ep length: {mean_l:.0f}\n"
-            f"Mean visited chunks: {mean_c:.1f}\n"
             f"Mean spawn distance: {mean_d:.0f}\n"
+            f"Best distance: {self._best_spawn_distance:.0f}\n"
+            f"Session Kills: {self._session_kills:,}\n"
+            f"Deaths/Timeouts: {self._session_deaths} / {self._session_timeouts}\n"
             f"Speed: {sps:.0f} steps/s\n"
             f"Elapsed: {elapsed/3600:.1f} h"
         )

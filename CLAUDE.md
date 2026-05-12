@@ -161,7 +161,9 @@ python train_multi.py --envs 2 --resume checkpoints/noita_ppo_2env_400000_steps.
   keeps Noita's engine from killing the player entity. When `virtual_hp` hits 0
   we teleport-respawn instead of triggering a real death sequence. This exists
   because Noita has no level-reset API — we can't reload the seed without
-  restarting the game.
+  restarting the game. *Why not just disable DamageModelComponent?* Because the 
+  engine natively handles damage numbers, stains, and physics reactions through it. 
+  We need it active to accurately read damage taken while intercepting the fatal blow.
 - **Spawn randomization** uses a `spawn_candidates` pool with `±30 px` X jitter
   to prevent the policy from overfitting to one corridor entrance.
 - **Initial descent into the Mines.** The surface biome has no corridor
@@ -174,6 +176,11 @@ python train_multi.py --envs 2 --resume checkpoints/noita_ppo_2env_400000_steps.
   JUMP_SPEED` when `is_on_ground` is true. Airborne, they are vertically
   no-ops. Re-enabling jetpack lets the agent farm sky-chunk curiosity
   indefinitely by flying upward.
+- **FRAME_SKIP = 4**. We process an action and send state every 4 frames (15 times 
+  a second at 60 FPS). This is a trade-off: it reduces CPU overhead and network 
+  latency while being fast enough for the agent to react to Noita's physics. 
+  Without frame skip, the agent struggles to correlate actions with delayed physics 
+  consequences.
 - **Action trace log**: every applied action is appended as one JSON line to
   `actions_trace.jsonl` (5 MB rotation). Useful for verifying that the agent's
   intended action actually became a `vx/vy` change on the physics tick.
