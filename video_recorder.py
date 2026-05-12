@@ -107,13 +107,13 @@ class VideoRecorder:
         recorder.stop()
     """
 
-    CAPTURE_FPS   = 10          # frames per second captured
+    CAPTURE_FPS   = 12          # frames per second captured
     PRE_SEC       = 5           # seconds of pre-event footage to keep
     RECORD_SEC    = 5           # max seconds of live recording per event
     POST_SEC      = 5           # seconds of post-event footage to append
     COOLDOWN_SEC  = 20          # min seconds between recordings
-    FRAME_W       = 480         # rescale width  (height is auto)
-    FRAME_H       = 300         # rescale height
+    FRAME_W       = 640         # rescale width
+    FRAME_H       = 400         # rescale height
     SAVE_DIR      = "data/highlights"
 
     def __init__(self, notifier, groq_api_key: str = ""):
@@ -133,7 +133,7 @@ class VideoRecorder:
         self._last_sent    = 0.0
 
         self._event_q: queue.Queue = queue.Queue()
-        self._window_bounds: Optional[dict] = None
+        self._window_hwnd: Optional[int] = None
 
         self._running = False
         self._threads: list[threading.Thread] = []
@@ -189,85 +189,118 @@ class VideoRecorder:
                 time.sleep(sleep)
 
     def _grab_frame(self) -> Optional[Image.Image]:
-        try:
-            import mss
-            bounds = self._window_bounds
-            if bounds is None:
-                bounds = self._find_noita_window()
-                if bounds is None:
-                    return None
-                self._window_bounds = bounds
-                logger.debug("VideoRecorder: found window bounds {}", bounds)
-            with mss.mss() as sct:
-                raw = sct.grab(bounds)
-                img = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
-                return img.resize((self.FRAME_W, self.FRAME_H), Image.BILINEAR)
-        except Exception as exc:
-            logger.debug("VideoRecorder: frame grab failed ({}), re-searching window", exc)
-            self._window_bounds = None
+        hwnd = self._window_hwnd
+        if hwnd is None:
+            hwnd = self._find_noita_hwnd()
+            if hwnd is None:
+                return None
+            self._window_hwnd = hwnd
+            logger.debug("VideoRecorder: found Noita hwnd={}", hwnd)
+        img = self._print_window(hwnd)
+        if img is None:
+            self._window_hwnd = None
             return None
+        return img.resize((self.FRAME_W, self.FRAME_H), Image.LANCZOS)
 
     @staticmethod
-    def _find_noita_window() -> Optional[dict]:
-        # Try pygetwindow first (any title containing "noita" — covers noita_dev.exe too)
-        try:
-            import pygetwindow as gw
-            matches = [t for t in gw.getAllTitles() if "noita" in t.lower() and t.strip()]
-            for title in matches:
-                try:
-                    wins = gw.getWindowsWithTitle(title)
-                    if wins:
-                        w = wins[0]
-                        if w.width >= 50 and w.height >= 50:
-                            return {
-                                "top":   max(0, w.top),
-                                "left":  max(0, w.left),
-                                "width": w.width,
-                                "height": w.height,
-                            }
-                except Exception:
-                    continue
-        except Exception:
-            pass
-
-        # Fallback: Win32 ctypes — no extra packages needed on Windows
+    def _find_noita_hwnd() -> Optional[int]:
+        """Return HWND of the first visible Noita window (any title variant)."""
         try:
             import ctypes
             import ctypes.wintypes as wt
 
-            found: list[dict] = []
+            found: list = []
 
             @ctypes.WINFUNCTYPE(ctypes.c_bool, wt.HWND, wt.LPARAM)
-            def _enum_cb(hwnd, _):
+            def _cb(hwnd, _):
                 if not ctypes.windll.user32.IsWindowVisible(hwnd):
                     return True
-                length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
-                if length == 0:
+                ln = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+                if not ln:
                     return True
-                buf = ctypes.create_unicode_buffer(length + 1)
-                ctypes.windll.user32.GetWindowTextW(hwnd, buf, length + 1)
+                buf = ctypes.create_unicode_buffer(ln + 1)
+                ctypes.windll.user32.GetWindowTextW(hwnd, buf, ln + 1)
                 if "noita" in buf.value.lower():
                     rect = wt.RECT()
-                    ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect))
-                    w = rect.right - rect.left
-                    h = rect.bottom - rect.top
-                    if w >= 50 and h >= 50:
-                        found.append({
-                            "top":   max(0, rect.top),
-                            "left":  max(0, rect.left),
-                            "width": w,
-                            "height": h,
-                        })
-                        return False  # stop after first match
+                    ctypes.windll.user32.GetClientRect(hwnd, ctypes.byref(rect))
+                    if rect.right >= 50 and rect.bottom >= 50:
+                        found.append(int(hwnd))
+                        return False
                 return True
 
-            ctypes.windll.user32.EnumWindows(_enum_cb, 0)
-            if found:
-                return found[0]
+            ctypes.windll.user32.EnumWindows(_cb, 0)
+            return found[0] if found else None
         except Exception:
-            pass
+            return None
 
-        return None
+    @staticmethod
+    def _print_window(hwnd: int) -> Optional[Image.Image]:
+        """
+        Capture window pixel content via PrintWindow — works even when the
+        window is behind other windows or minimized.
+        PW_RENDERFULLCONTENT (flag=2) forces DWM to render GPU/OpenGL content.
+        """
+        try:
+            import ctypes
+            import ctypes.wintypes as wt
+
+            user32 = ctypes.windll.user32
+            gdi32  = ctypes.windll.gdi32
+
+            if not user32.IsWindow(hwnd):
+                return None
+
+            rect = wt.RECT()
+            user32.GetClientRect(hwnd, ctypes.byref(rect))
+            w, h = rect.right, rect.bottom
+            if w <= 0 or h <= 0:
+                return None
+
+            hdc_src = user32.GetWindowDC(hwnd)
+            hdc_mem = gdi32.CreateCompatibleDC(hdc_src)
+            hbmp    = gdi32.CreateCompatibleBitmap(hdc_src, w, h)
+            gdi32.SelectObject(hdc_mem, hbmp)
+
+            # Flag 3 = PW_CLIENTONLY(1) | PW_RENDERFULLCONTENT(2)
+            user32.PrintWindow(hwnd, hdc_mem, 3)
+
+            class _BIH(ctypes.Structure):
+                _fields_ = [
+                    ("biSize",          ctypes.c_uint32),
+                    ("biWidth",         ctypes.c_int32),
+                    ("biHeight",        ctypes.c_int32),
+                    ("biPlanes",        ctypes.c_uint16),
+                    ("biBitCount",      ctypes.c_uint16),
+                    ("biCompression",   ctypes.c_uint32),
+                    ("biSizeImage",     ctypes.c_uint32),
+                    ("biXPelsPerMeter", ctypes.c_int32),
+                    ("biYPelsPerMeter", ctypes.c_int32),
+                    ("biClrUsed",       ctypes.c_uint32),
+                    ("biClrImportant",  ctypes.c_uint32),
+                ]
+
+            bih = _BIH()
+            bih.biSize      = ctypes.sizeof(_BIH)
+            bih.biWidth     = w
+            bih.biHeight    = -h  # negative = top-down
+            bih.biPlanes    = 1
+            bih.biBitCount  = 32
+            bih.biCompression = 0  # BI_RGB
+
+            raw = (ctypes.c_char * (w * h * 4))()
+            lines = gdi32.GetDIBits(hdc_mem, hbmp, 0, h, raw, ctypes.byref(bih), 0)
+
+            img = None
+            if lines > 0:
+                img = Image.frombuffer("RGBA", (w, h), bytes(raw), "raw", "BGRA", 0, 1).convert("RGB")
+
+            gdi32.DeleteObject(hbmp)
+            gdi32.DeleteDC(hdc_mem)
+            user32.ReleaseDC(hwnd, hdc_src)
+            return img
+        except Exception as exc:
+            logger.debug("VideoRecorder: PrintWindow failed: {}", exc)
+            return None
 
     # ── Event loop ────────────────────────────────────────────────────────────
 
@@ -391,16 +424,31 @@ class VideoRecorder:
                 logger.warning("VideoRecorder: TG send failed: {}", exc2)
 
     def _make_gif(self, frames: list) -> bytes:
-        buf  = io.BytesIO()
-        dur  = max(50, int(1000 / self.CAPTURE_FPS))
-        frames[0].save(
+        buf = io.BytesIO()
+        dur = max(40, int(1000 / self.CAPTURE_FPS))
+
+        # Build a unified palette from a sample of all frames so colours are
+        # consistent across the clip (avoids palette-flicker between frames).
+        import numpy as np
+        pixels = np.concatenate(
+            [np.array(f).reshape(-1, 3) for f in frames[::max(1, len(frames)//10)]],
+            axis=0,
+        )
+        idx = np.random.default_rng(0).choice(len(pixels), min(50_000, len(pixels)), replace=False)
+        sample_img = Image.fromarray(pixels[idx].reshape(-1, 1, 3).astype("uint8"))
+        palette_img = sample_img.quantize(colors=255, method=Image.Quantize.FASTOCTREE)
+
+        # Quantize each frame to the shared palette with Floyd-Steinberg dithering
+        quantized = [f.quantize(palette=palette_img, dither=1) for f in frames]
+
+        quantized[0].save(
             buf,
             format="GIF",
             save_all=True,
-            append_images=frames[1:],
+            append_images=quantized[1:],
             duration=dur,
             loop=0,
-            optimize=True,
+            optimize=False,  # skip slow LZW re-optimisation when using shared palette
         )
         return buf.getvalue()
 

@@ -220,26 +220,12 @@ class TelegramNotifier:
         self._stats_fn = fn
 
     @staticmethod
-    def _find_noita_bounds() -> Optional[dict]:
-        """Return window bounds for any window with 'noita' in title, or None."""
-        try:
-            import pygetwindow as gw
-            matches = [t for t in gw.getAllTitles() if "noita" in t.lower() and t.strip()]
-            for title in matches:
-                try:
-                    wins = gw.getWindowsWithTitle(title)
-                    if wins:
-                        w = wins[0]
-                        if w.width >= 50 and w.height >= 50:
-                            return {"top": max(0, w.top), "left": max(0, w.left),
-                                    "width": w.width, "height": w.height}
-                except Exception:
-                    continue
-        except Exception:
-            pass
+    def _find_noita_hwnd() -> Optional[int]:
+        """Return HWND of the first visible Noita window (covers noita_dev.exe too)."""
         try:
             import ctypes
             import ctypes.wintypes as wt
+
             found: list = []
 
             @ctypes.WINFUNCTYPE(ctypes.c_bool, wt.HWND, wt.LPARAM)
@@ -252,52 +238,113 @@ class TelegramNotifier:
                 buf = ctypes.create_unicode_buffer(ln + 1)
                 ctypes.windll.user32.GetWindowTextW(hwnd, buf, ln + 1)
                 if "noita" in buf.value.lower():
-                    r = wt.RECT()
-                    ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(r))
-                    w, h = r.right - r.left, r.bottom - r.top
-                    if w >= 50 and h >= 50:
-                        found.append({"top": max(0, r.top), "left": max(0, r.left),
-                                      "width": w, "height": h})
+                    rect = wt.RECT()
+                    ctypes.windll.user32.GetClientRect(hwnd, ctypes.byref(rect))
+                    if rect.right >= 50 and rect.bottom >= 50:
+                        found.append(int(hwnd))
                         return False
                 return True
 
             ctypes.windll.user32.EnumWindows(_cb, 0)
-            if found:
-                return found[0]
+            return found[0] if found else None
         except Exception:
-            pass
-        return None
+            return None
+
+    @staticmethod
+    def _print_window_to_image(hwnd: int) -> Optional["Image.Image"]:
+        """Render window into PIL Image via PrintWindow — works in background."""
+        try:
+            import ctypes
+            import ctypes.wintypes as wt
+            from PIL import Image
+
+            user32 = ctypes.windll.user32
+            gdi32  = ctypes.windll.gdi32
+
+            if not user32.IsWindow(hwnd):
+                return None
+
+            rect = wt.RECT()
+            user32.GetClientRect(hwnd, ctypes.byref(rect))
+            w, h = rect.right, rect.bottom
+            if w <= 0 or h <= 0:
+                return None
+
+            hdc_src = user32.GetWindowDC(hwnd)
+            hdc_mem = gdi32.CreateCompatibleDC(hdc_src)
+            hbmp    = gdi32.CreateCompatibleBitmap(hdc_src, w, h)
+            gdi32.SelectObject(hdc_mem, hbmp)
+
+            # PW_CLIENTONLY(1) | PW_RENDERFULLCONTENT(2) — renders GPU/OpenGL content
+            user32.PrintWindow(hwnd, hdc_mem, 3)
+
+            class _BIH(ctypes.Structure):
+                _fields_ = [
+                    ("biSize",          ctypes.c_uint32),
+                    ("biWidth",         ctypes.c_int32),
+                    ("biHeight",        ctypes.c_int32),
+                    ("biPlanes",        ctypes.c_uint16),
+                    ("biBitCount",      ctypes.c_uint16),
+                    ("biCompression",   ctypes.c_uint32),
+                    ("biSizeImage",     ctypes.c_uint32),
+                    ("biXPelsPerMeter", ctypes.c_int32),
+                    ("biYPelsPerMeter", ctypes.c_int32),
+                    ("biClrUsed",       ctypes.c_uint32),
+                    ("biClrImportant",  ctypes.c_uint32),
+                ]
+
+            bih = _BIH()
+            bih.biSize = ctypes.sizeof(_BIH)
+            bih.biWidth = w
+            bih.biHeight = -h
+            bih.biPlanes = 1
+            bih.biBitCount = 32
+            bih.biCompression = 0
+
+            raw = (ctypes.c_char * (w * h * 4))()
+            lines = gdi32.GetDIBits(hdc_mem, hbmp, 0, h, raw, ctypes.byref(bih), 0)
+
+            img = None
+            if lines > 0:
+                img = Image.frombuffer("RGBA", (w, h), bytes(raw), "raw", "BGRA", 0, 1).convert("RGB")
+
+            gdi32.DeleteObject(hbmp)
+            gdi32.DeleteDC(hdc_mem)
+            user32.ReleaseDC(hwnd, hdc_src)
+            return img
+        except Exception as exc:
+            logger.debug("notify: PrintWindow failed: {}", exc)
+            return None
 
     def capture_noita_screen(self, overlay_text: str = "") -> bytes:
         import io
         try:
-            import mss
             from PIL import Image
 
-            bounds = self._find_noita_bounds()
-            if not bounds:
+            hwnd = self._find_noita_hwnd()
+            if hwnd is None:
                 return b""
 
-            with mss.mss() as sct:
-                monitor = bounds
-                sct_img = sct.grab(monitor)
-                img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
-                
-                if overlay_text:
-                    draw = ImageDraw.Draw(img)
-                    try:
-                        font = ImageFont.truetype("arial.ttf", 24)
-                    except IOError:
-                        font = ImageFont.load_default()
-                    
-                    # Draw background box for readability
-                    text_bbox = draw.textbbox((10, 10), overlay_text, font=font)
-                    draw.rectangle([text_bbox[0]-5, text_bbox[1]-5, text_bbox[2]+5, text_bbox[3]+5], fill=(0, 0, 0, 150))
-                    draw.text((10, 10), overlay_text, fill=(0, 255, 0), font=font)
+            img = self._print_window_to_image(hwnd)
+            if img is None:
+                return b""
 
-                buf = io.BytesIO()
-                img.save(buf, format="PNG")
-                return buf.getvalue()
+            if overlay_text:
+                draw = ImageDraw.Draw(img)
+                try:
+                    font = ImageFont.truetype("arial.ttf", 24)
+                except IOError:
+                    font = ImageFont.load_default()
+                text_bbox = draw.textbbox((10, 10), overlay_text, font=font)
+                draw.rectangle(
+                    [text_bbox[0]-5, text_bbox[1]-5, text_bbox[2]+5, text_bbox[3]+5],
+                    fill=(0, 0, 0, 150),
+                )
+                draw.text((10, 10), overlay_text, fill=(0, 255, 0), font=font)
+
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            return buf.getvalue()
         except Exception as e:
             logger.error("Failed to capture screen: {}", e)
             return b""
