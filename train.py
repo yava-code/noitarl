@@ -105,6 +105,7 @@ def train(args: argparse.Namespace) -> None:
 
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
     os.makedirs(cfg.tensorboard_dir, exist_ok=True)
+    os.makedirs("data", exist_ok=True)
 
     # ── Notifier ──────────────────────────────────────────────────────────────
     notifier = TelegramNotifier(cfg.telegram_token, cfg.telegram_chat_id)

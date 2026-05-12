@@ -20,6 +20,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import requests
 from loguru import logger
+from PIL import Image, ImageDraw, ImageFont
 
 
 class TelegramNotifier:
@@ -90,6 +91,52 @@ class TelegramNotifier:
         plt.close(fig)
         buf.seek(0)
         return buf.read()
+
+    @staticmethod
+    def make_route_plot(route_x: list[float], route_y: list[float], title: str = "Agent Route") -> bytes:
+        fig, ax = plt.subplots(figsize=(6, 6))
+        ax.plot(route_x, route_y, color='red', alpha=0.7, linewidth=1.5, marker='o', markersize=2, markevery=10)
+        ax.set_xlabel("X (px)")
+        ax.set_ylabel("Y (px)")
+        ax.set_title(title)
+        ax.invert_yaxis()
+        ax.grid(True, alpha=0.3)
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=120, bbox_inches="tight")
+        plt.close(fig)
+        buf.seek(0)
+        return buf.read()
+
+    @staticmethod
+    def make_death_postcard(png_bytes: bytes, stats_text: str) -> bytes:
+        if not png_bytes:
+            return b""
+        try:
+            img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+            draw = ImageDraw.Draw(img)
+            try:
+                font = ImageFont.truetype("arial.ttf", 24)
+            except IOError:
+                font = ImageFont.load_default()
+                
+            # Add a semi-transparent black rectangle at the bottom
+            width, height = img.size
+            box_height = 60
+            overlay = Image.new('RGBA', img.size, (0, 0, 0, 0))
+            overlay_draw = ImageDraw.Draw(overlay)
+            overlay_draw.rectangle(((0, height - box_height), (width, height)), fill=(0, 0, 0, 180))
+            img = Image.alpha_composite(img.convert('RGBA'), overlay).convert('RGB')
+            
+            # Draw text
+            draw = ImageDraw.Draw(img)
+            draw.text((10, height - box_height + 10), stats_text, font=font, fill=(255, 255, 255))
+            
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            return buf.getvalue()
+        except Exception as e:
+            logger.error(f"Failed to create death postcard: {e}")
+            return png_bytes
 
     # ── Command bot ───────────────────────────────────────────────────────────
 

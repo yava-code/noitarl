@@ -78,7 +78,7 @@ local gui                       = nil
 -- ── Movement constants ────────────────────────────────────────────────────
 local MOVE_SPEED     = 60
 local JUMP_SPEED     = -150
-local FRAME_SKIP     = 4      -- accept new action / send state every N frames
+local FRAME_SKIP     = 4      -- Process action/state every 4 frames (trade-off: reduces CPU overhead while keeping fast 15 FPS reactions)
 
 -- Jetpack is intentionally disabled — actions 3/4/5 are no-ops vertically
 -- when airborne. Without this constraint the agent learns to fly to the
@@ -95,6 +95,8 @@ local initial_descent_done   = false
 
 -- Immortal-agent HP hack: engine never kills the player;
 -- we track "virtual HP" ourselves and teleport-respawn when it hits 0.
+-- Why not disable DamageModelComponent? Because the engine handles damage numbers, 
+-- stains, and physics reactions through it natively.
 local IMMORTAL_HP    = 10000.0
 local VIRTUAL_MAX_HP = 4.0    -- 4.0 engine units ≈ 100% HP in UI
 local virtual_hp     = VIRTUAL_MAX_HP
@@ -125,7 +127,7 @@ local MAX_EP_STEPS    = 4000  -- ~4.5 min at 60 fps with FRAME_SKIP=4
 -- spawn_candidates accumulates good "anchor" positions; respawn picks one at random
 local spawn_x, spawn_y      = nil, nil   -- recorded on first frame
 local spawn_candidates      = {}         -- list of {x=, y=}
-local SPAWN_JITTER          = 30
+local SPAWN_JITTER          = 30         -- Random ± X jitter to prevent policy from overfitting to a single corridor start
 local episode_num           = 0
 local episode_steps         = 0
 local frame_times           = {}   -- rolling window for FPS estimate

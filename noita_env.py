@@ -29,11 +29,15 @@ import json
 import threading
 import time
 from typing import Any, Optional
+from collections import Counter
+import io
 
 import numpy as np
 import websockets
 import gymnasium as gym
 from loguru import logger
+import mss
+from PIL import Image
 
 
 class NoitaEnv(gym.Env):
@@ -69,8 +73,17 @@ class NoitaEnv(gym.Env):
         self.spawn_x             = 0.0
         self.spawn_y             = 0.0
         self.max_spawn_distance  = 0.0
+        self.max_x               = 0.0
+        self.total_damage        = 0.0
+        self.episode_start_time  = time.time()
         self.steps_without_progress = 0
         self.visited_chunks: set = set()
+        
+        self.route_x: list[float] = []
+        self.route_y: list[float] = []
+        self.action_history: list[int] = []
+
+        self.sct = mss.mss()
 
         self._start_server()
         logger.info("[env:{}] WebSocket server on {}:{}", port, host, port)
@@ -204,8 +217,14 @@ class NoitaEnv(gym.Env):
         self.last_gold               = 0
         self.last_kills              = 0
         self.max_spawn_distance      = 0.0
+        self.max_x                   = 0.0
+        self.total_damage            = 0.0
+        self.episode_start_time      = time.time()
         self.steps_without_progress  = 0
         self.visited_chunks          = set()
+        self.route_x                 = []
+        self.route_y                 = []
+        self.action_history          = []
 
         logger.debug("[env:{}] reset() — episode {}", self.port, self.episode_num)
 
@@ -219,6 +238,7 @@ class NoitaEnv(gym.Env):
             self.last_x      = s.get("x", 0.0)
             self.spawn_x     = s.get("x", 0.0)
             self.spawn_y     = s.get("y", 0.0)
+            self.max_x       = self.spawn_x
             self.last_gold   = s.get("gold",  0)
             self.last_kills  = s.get("kills", 0)
 
@@ -288,7 +308,11 @@ class NoitaEnv(gym.Env):
 
         # 5. Damage / kills (kept, milder)
         if current_hp < self.last_hp:
-            reward -= (self.last_hp - current_hp) * 1.0
+            damage = self.last_hp - current_hp
+            reward -= damage * 1.0
+            self.total_damage += damage
+
+        self.max_x = max(self.max_x, current_x)
 
         current_kills = state.get("kills", 0)
         if current_kills > self.last_kills:
@@ -303,20 +327,62 @@ class NoitaEnv(gym.Env):
         self.episode_steps  += 1
         self.episode_reward += reward
 
+        self.route_x.append(current_x)
+        self.route_y.append(current_y)
+        self.action_history.append(int(action))
+
+        visually_stuck = False
+        action_loop = False
+        if len(self.route_x) >= 200:
+            wx = self.route_x[-200:]
+            wy = self.route_y[-200:]
+            if max(wx) - min(wx) < 20 and max(wy) - min(wy) < 20:
+                visually_stuck = True
+        
+        if len(self.action_history) >= 500:
+            wa = self.action_history[-500:]
+            c = Counter(wa)
+            if c.most_common(1)[0][1] > 400: # 80% of 500
+                action_loop = True
+
         if dead or truncated:
+            reason = "TRUNC" if truncated and not dead else "DEAD"
             logger.info(
                 "[env:{}] Ep {:3d} done — steps={} reward={:.2f} "
                 "max_dist={:.0f} max_depth={:.0f} chunks={} ({})",
                 self.port, self.episode_num, self.episode_steps,
                 self.episode_reward, self.max_spawn_distance,
                 self.max_depth_y, len(self.visited_chunks),
-                "TRUNC" if truncated and not dead else "DEAD",
+                reason,
             )
+            
+            screenshot_bytes = None
+            try:
+                sct_img = self.sct.grab(self.sct.monitors[1])
+                img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+                screenshot_bytes = buf.getvalue()
+            except Exception as exc:
+                logger.debug("[env:{}] Screenshot failed: {}", self.port, exc)
+
+            run_time = time.time() - self.episode_start_time
             info = {
                 "episode": {"r": self.episode_reward, "l": self.episode_steps},
                 "noita/visited_chunks":     len(self.visited_chunks),
                 "noita/max_spawn_distance": float(self.max_spawn_distance),
                 "noita/max_depth":          float(self.max_depth_y),
+                "noita/max_x":              float(self.max_x),
+                "noita/kills":              int(self.last_kills),
+                "noita/total_damage":       float(self.total_damage),
+                "noita/run_time_s":         float(run_time),
+                "noita/steps_without_progress": int(self.steps_without_progress),
+                "noita/death_reason":       reason,
+                "noita/screenshot":         screenshot_bytes,
+                "noita/route_x":            self.route_x,
+                "noita/route_y":            self.route_y,
+                "noita/visually_stuck":     visually_stuck,
+                "noita/action_loop":        action_loop,
             }
             with self._lock:
                 self._state = None   # force reset() to wait for fresh state

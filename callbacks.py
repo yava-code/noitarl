@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import os
 import time
+import csv
 from collections import deque
 from typing import Optional
 
+import glob
 import numpy as np
 from loguru import logger
 from rich.console import Console
@@ -58,10 +60,30 @@ class NoitaMonitorCallback(BaseCallback):
         self._total_episodes = 0
         self._stop_requested = False
 
+        self._consecutive_timeouts = 0
+        self._best_spawn_distance = 0.0
+        self._session_deaths = 0
+        self._session_timeouts = 0
+        self._session_kills = 0
+        self._current_ep_start_step = 0
+
+        os.makedirs("data", exist_ok=True)
+        os.makedirs("data/hall_of_fame", exist_ok=True)
+        self._csv_path = "data/episode_history.csv"
+        if not os.path.exists(self._csv_path):
+            with open(self._csv_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "global_step", "episode", "reward", "length", "visited_chunks",
+                    "max_spawn_distance", "max_depth", "max_x", "kills", 
+                    "total_damage", "run_time_s", "death_reason"
+                ])
+
         # Register Telegram commands
         notifier.register_stats_provider(self._stats_text)
         notifier.register_command("stop",  self._cmd_stop)
         notifier.register_command("plot",  self._cmd_plot)
+        notifier.register_command("best",  self._cmd_best)
         notifier.register_command("help",  self._cmd_help)
 
     # ── SB3 lifecycle ─────────────────────────────────────────────────────────
@@ -82,7 +104,6 @@ class NoitaMonitorCallback(BaseCallback):
             self._tg.send_text("⛔ Training stopped on your request.")
             return False  # signals SB3 to stop
 
-        # Harvest completed episode info from SB3's internal buffer
         infos = self.locals.get("infos", [])
         for info in infos:
             ep = info.get("episode")
@@ -93,22 +114,75 @@ class NoitaMonitorCallback(BaseCallback):
             chunks = int(info.get("noita/visited_chunks", 0))
             dist   = float(info.get("noita/max_spawn_distance", 0.0))
             depth  = float(info.get("noita/max_depth", 0.0))
+
+            max_x = float(info.get("noita/max_x", 0.0))
+            kills = int(info.get("noita/kills", 0))
+            total_damage = float(info.get("noita/total_damage", 0.0))
+            run_time = float(info.get("noita/run_time_s", 0.0))
+            death_reason = info.get("noita/death_reason", "UNKNOWN")
+            
+            screenshot = info.get("noita/screenshot")
+            route_x = info.get("noita/route_x", [])
+            route_y = info.get("noita/route_y", [])
+            visually_stuck = info.get("noita/visually_stuck", False)
+            action_loop = info.get("noita/action_loop", False)
+
             self._ep_rewards.append(r)
             self._ep_lengths.append(l)
             self._ep_chunks.append(chunks)
             self._ep_distances.append(dist)
             self._total_episodes += 1
+            self._current_ep_start_step = self.num_timesteps
+
+            self._session_kills += kills
+            if death_reason == "DEAD":
+                self._session_deaths += 1
+                self._consecutive_timeouts = 0
+            elif death_reason == "TRUNC":
+                self._session_timeouts += 1
+                self._consecutive_timeouts += 1
+
+            with open(self._csv_path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    self.num_timesteps, self._total_episodes, r, l, chunks,
+                    dist, depth, max_x, kills, total_damage, run_time, death_reason
+                ])
+
+            stats_str = f"Ep {self._total_episodes} | {dist:.0f}px | {kills} kills | {death_reason}"
+            if screenshot:
+                # Save screenshot temporarily in case it's a record or we need to send it
+                postcard = TelegramNotifier.make_death_postcard(screenshot, stats_str)
+            else:
+                postcard = b""
+
+            if dist > self._best_spawn_distance:
+                self._best_spawn_distance = dist
+                self._on_new_record(dist, depth, kills, route_x, route_y, postcard)
+
+            # Check alerts
+            if visually_stuck:
+                self._tg.send_photo(postcard, caption="⚠️ <b>Agent is visually stuck!</b>\nCoordinates barely changed for 200 steps.")
+            if action_loop:
+                self._tg.send_photo(postcard, caption="⚠️ <b>Agent in action loop!</b>\nDoing the same action for >80% of the last 500 steps.")
+
+            if self._consecutive_timeouts >= 5:
+                self._tg.send_text("⚠️ <b>Agent stuck!</b>\n5 consecutive timeouts without progress.")
+                self._consecutive_timeouts = 0
 
             # Log every episode to loguru
             logger.debug(
-                "ep={} reward={:.2f} length={} chunks={} dist={:.0f} steps={}",
-                self._total_episodes, r, l, chunks, dist, self.num_timesteps,
+                "ep={} reward={:.2f} length={} chunks={} dist={:.0f} depth={:.0f} kills={} reason={} steps={}",
+                self._total_episodes, r, l, chunks, dist, depth, kills, death_reason, self.num_timesteps,
             )
 
             # Surface in SB3's "rollout/" namespace for TensorBoard
             self.logger.record("noita/visited_chunks",     chunks)
             self.logger.record("noita/max_spawn_distance", dist)
             self.logger.record("noita/max_depth",          depth)
+            self.logger.record("noita/max_x",              max_x)
+            self.logger.record("noita/kills",              kills)
+            self.logger.record("noita/total_damage",       total_damage)
 
             # W&B per-episode
             if self._cfg.wandb_enabled and _WANDB_OK:
@@ -118,6 +192,9 @@ class NoitaMonitorCallback(BaseCallback):
                     "episode/visited_chunks": chunks,
                     "episode/spawn_distance": dist,
                     "episode/max_depth":      depth,
+                    "episode/kills":          kills,
+                    "episode/total_damage":   total_damage,
+                    "episode/run_time_s":     run_time,
                     "episode/total":          self._total_episodes,
                 }, step=self.num_timesteps)
 
@@ -171,6 +248,30 @@ class NoitaMonitorCallback(BaseCallback):
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
+    def _on_new_record(self, dist: float, depth: float, kills: int, rx: list, ry: list, postcard: bytes) -> None:
+        logger.info("🏆 New Record! Distance: {:.0f} | Depth: {:.0f} | Kills: {}", dist, depth, kills)
+        
+        # Save to Hall of Fame
+        if postcard:
+            fname = f"data/hall_of_fame/run_{int(dist)}px_ep{self._total_episodes}.png"
+            with open(fname, "wb") as f:
+                f.write(postcard)
+
+        caption = (
+            f"🏆 <b>New Record Run!</b>\n"
+            f"Max Spawn Distance: {dist:.0f} px\n"
+            f"Max Depth: {depth:.0f} px\n"
+            f"Kills: {kills}"
+        )
+        if postcard:
+            self._tg.send_photo(postcard, caption=caption)
+        else:
+            self._tg.send_text(caption)
+            
+        if rx and ry:
+            route_png = TelegramNotifier.make_route_plot(rx, ry, title=f"Record Route: {dist:.0f}px")
+            self._tg.send_photo(route_png, caption="GPS Track")
+
     def _stats_text(self) -> str:
         elapsed = time.time() - self._start_ts
         pct = self.num_timesteps / max(self._cfg.total_timesteps, 1) * 100
@@ -179,13 +280,19 @@ class NoitaMonitorCallback(BaseCallback):
         mean_c = float(np.mean(self._ep_chunks))    if self._ep_chunks    else 0.0
         mean_d = float(np.mean(self._ep_distances)) if self._ep_distances else 0.0
         sps = self.num_timesteps / max(elapsed, 1)
+        
+        current_ep_length = self.num_timesteps - self._current_ep_start_step
+        
         return (
             f"Steps: {self.num_timesteps:,} / {self._cfg.total_timesteps:,} ({pct:.1f}%)\n"
             f"Episodes: {self._total_episodes:,}\n"
+            f"Current Ep Steps: {current_ep_length:,}\n"
             f"Mean reward: {mean_r:.2f}\n"
             f"Mean ep length: {mean_l:.0f}\n"
-            f"Mean visited chunks: {mean_c:.1f}\n"
             f"Mean spawn distance: {mean_d:.0f}\n"
+            f"Best distance: {self._best_spawn_distance:.0f}\n"
+            f"Session Kills: {self._session_kills:,}\n"
+            f"Deaths/Timeouts: {self._session_deaths} / {self._session_timeouts}\n"
             f"Speed: {sps:.0f} steps/s\n"
             f"Elapsed: {elapsed/3600:.1f} h"
         )
@@ -238,11 +345,35 @@ class NoitaMonitorCallback(BaseCallback):
         )
         self._tg.send_photo(png, caption=f"Episodes: {self._total_episodes}")
 
+    def _cmd_best(self) -> None:
+        files = glob.glob("data/hall_of_fame/run_*.png")
+        if not files:
+            self._tg.send_text("No runs in the Hall of Fame yet.")
+            return
+        
+        # Sort by distance (extracted from filename run_XXXXpx_epYYY.png)
+        def get_dist(f):
+            try:
+                return int(os.path.basename(f).split('_')[1].replace('px', ''))
+            except:
+                return 0
+        
+        files.sort(key=get_dist, reverse=True)
+        best_file = files[0]
+        
+        top_list = "\n".join([f"🏅 {os.path.basename(f).replace('.png', '')}" for f in files[:5]])
+        
+        with open(best_file, "rb") as f:
+            best_png = f.read()
+        
+        self._tg.send_photo(best_png, caption=f"🌟 <b>Hall of Fame (Top 5)</b>\n\n{top_list}")
+
     def _cmd_help(self) -> None:
         self._tg.send_text(
             "🤖 <b>NoitaRL Bot commands</b>\n"
             "/status — current training stats\n"
             "/plot   — send reward graph\n"
+            "/best   — show hall of fame\n"
             "/stop   — stop training gracefully\n"
             "/help   — this message"
         )
