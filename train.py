@@ -13,6 +13,10 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+
+# Workaround for OpenMP duplicate library error
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 import time
 
 from loguru import logger

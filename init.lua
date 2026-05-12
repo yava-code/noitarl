@@ -755,12 +755,12 @@ function OnWorldPostUpdate()
     if dmg then
         is_on_fire = (cget(dmg, "is_on_fire") == true) and 1.0 or 0.0
     end
-    -- Poison/radiation: try several effect names — engine builds differ.
+    -- Poison/radiation: only RADIOACTIVE is a valid enum in this build. Other names
+    -- (POISONED / STAINED_RADIOACTIVE) make the C++ enum parser spam stderr — those
+    -- warnings bypass Lua pcall, so we MUST stick to the one valid name here.
     local is_poisoned = 0.0
-    for _, eff in ipairs({"RADIOACTIVE", "POISONED", "STAINED_RADIOACTIVE"}) do
-        local ok_eff, fc = pcall(GameGetGameEffectCount, player, eff)
-        if ok_eff and fc and fc > 0 then is_poisoned = 1.0; break end
-    end
+    local ok_eff, fc = pcall(GameGetGameEffectCount, player, "RADIOACTIVE")
+    if ok_eff and fc and fc > 0 then is_poisoned = 1.0 end
 
     -- Sky visibility: 1=open sky, 0=deep underground (depth proxy)
     local sky_ok, sky_v = pcall(GameGetSkyVisibility, x, y)
