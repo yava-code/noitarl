@@ -162,7 +162,7 @@ local ACTION_DECODE = {
     [8]={ 0, false, false, false, true,  false },
     [9]={ 0, false, false, false, false, true  },
 }
-local MAX_EP_STEPS    = 4000  -- ~4.5 min at 60 fps with FRAME_SKIP=4
+local MAX_EP_STEPS    = 1500  -- ~1.7 min at 60 fps with FRAME_SKIP=4; agent must descend
 
 -- ── Episode tracking ──────────────────────────────────────────────────────
 -- spawn_candidates accumulates good "anchor" positions; respawn picks one at random
@@ -172,6 +172,16 @@ local SPAWN_JITTER          = 30         -- Random ± X jitter to prevent policy
 local episode_num           = 0
 local episode_steps         = 0
 local frame_times           = {}   -- rolling window for FPS estimate
+
+-- ── Static-position stuck detector ───────────────────────────────────────
+-- If the agent's world position hasn't moved more than STATIC_THRESHOLD px
+-- in STATIC_CHECK_FRAMES consecutive frames → force respawn.
+-- Catches Lua-side freezes that the Python 300-step truncation can't see.
+local STATIC_CHECK_FRAMES   = 200
+local STATIC_THRESHOLD      = 5.0
+local static_last_x         = nil
+local static_last_y         = nil
+local static_frames_elapsed = 0
 local PERF_WINDOW           = 60
 
 -- Action trace log (one line per applied action) for offline debugging
@@ -364,8 +374,27 @@ end
 local function respawn_player(player)
     virtual_hp = VIRTUAL_MAX_HP
 
-    local sx, sy = pick_spawn()
-    local ok, e  = pcall(EntitySetTransform, player, sx, sy)
+    -- Pick a spawn from the underground candidate pool (populated on first
+    -- descent). If the pool is somehow empty, redo the INITIAL_DESCENT_RANGE
+    -- raycast from the player's current position so we always land in the Mines.
+    local sx, sy
+    if #spawn_candidates > 0 then
+        sx, sy = pick_spawn()
+    else
+        local ok0, px, py = pcall(EntityGetTransform, player)
+        sx, sy = ok0 and px or 0, ok0 and py or 0
+        local rok, hit, _hx, hy = pcall(
+            RaytracePlatforms, sx, sy + 10, sx, sy + INITIAL_DESCENT_RANGE)
+        if rok and hit then
+            sy = hy - INITIAL_DESCENT_LIFT
+        else
+            sy = sy + 400  -- fallback if raycast misses
+        end
+        spawn_candidates[#spawn_candidates + 1] = { x = sx, y = sy }
+        warn("spawn_candidates was empty — re-descended to (" .. sx .. "," .. sy .. ")")
+    end
+
+    local ok, e = pcall(EntitySetTransform, player, sx, sy)
     if not ok then warn("EntitySetTransform failed: " .. tostring(e)) end
 
     local cdata = EntityGetFirstComponent(player, "CharacterDataComponent")
@@ -374,12 +403,17 @@ local function respawn_player(player)
         cset(cdata, "mFlyingTimeLeft", 1000.0)
     end
 
-    -- Remove fire/toxic stain effects, then douse with water for good measure
+    -- Clear status effects
     pcall(EntityRemoveStainStatusEffect,     player, "stain_fire")
     pcall(EntityRemoveStainStatusEffect,     player, "stain_radioactive_gas_1")
     pcall(EntityRemoveIngestionStatusEffect, player, "RADIOACTIVE")
     local water_id = CellFactory_GetType("water")
     pcall(EntityAddRandomStains, player, water_id, 400)
+
+    -- Reset static-stuck detector so a new episode starts fresh
+    static_last_x         = nil
+    static_last_y         = nil
+    static_frames_elapsed = 0
 
     episode_num       = episode_num + 1
     episode_steps     = 0
@@ -732,7 +766,16 @@ function OnWorldPostUpdate()
     if msg and type(msg) == "string" and #msg > 0 then
         local ok2, act = pcall(json.decode, msg)
         if ok2 and type(act) == "number" then
-            pending_action = math.floor(act)
+            if act == -1 then
+                -- Python truncated the episode (no-descent penalty).
+                -- Setting virtual_hp=0 triggers the normal death-detection block
+                -- at the end of this frame: it will send dead_state, call
+                -- respawn_player(), and start a fresh episode automatically.
+                info("Force-respawn requested by Python (cowardice truncation)")
+                virtual_hp = 0.0
+            else
+                pending_action = math.floor(act)
+            end
         else
             warn("Bad action payload: " .. msg:sub(1, 40))
         end
@@ -848,6 +891,26 @@ function OnWorldPostUpdate()
     GuiIdPop(gui)
 
     episode_steps = episode_steps + 1
+
+    -- ── Static-position stuck detector ───────────────────────────────────
+    -- Only runs on action frames (frame % FRAME_SKIP == 0, already guaranteed
+    -- above), so STATIC_CHECK_FRAMES corresponds to FRAME_SKIP × N real frames.
+    static_frames_elapsed = static_frames_elapsed + 1
+    if static_frames_elapsed >= STATIC_CHECK_FRAMES then
+        if static_last_x ~= nil then
+            local dx = math.abs(x - static_last_x)
+            local dy = math.abs(y - static_last_y)
+            if dx < STATIC_THRESHOLD and dy < STATIC_THRESHOLD then
+                warn(string.format(
+                    "Stuck detected: pos unchanged (%.1fpx) over %d steps — forcing respawn",
+                    math.sqrt(dx*dx + dy*dy), STATIC_CHECK_FRAMES))
+                virtual_hp = 0.0  -- triggers death detection at end of frame
+            end
+        end
+        static_last_x         = x
+        static_last_y         = y
+        static_frames_elapsed = 0
+    end
 
     -- Periodic diagnostic log ──────────────────────────────────────────────
     if (frame % 300) == 0 then

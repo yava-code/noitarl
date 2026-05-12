@@ -86,12 +86,12 @@ class NoitaEnv(gym.Env):
         self.last_chests         = 0
         self.spawn_x             = 0.0
         self.spawn_y             = 0.0
-        self.max_spawn_distance  = 0.0
-        self.max_x               = 0.0
-        self.total_damage        = 0.0
-        self.episode_start_time  = time.time()
-        self.steps_without_progress = 0
-        self.visited_chunks: set = set()
+        self.max_spawn_distance   = 0.0   # logged only, not rewarded
+        self.max_x                = 0.0
+        self.total_damage         = 0.0
+        self.episode_start_time   = time.time()
+        self.steps_without_descent = 0   # resets only on new depth record
+        self.visited_chunks: set  = set()
         
         self.route_x: list[float] = []
         self.route_y: list[float] = []
@@ -243,7 +243,7 @@ class NoitaEnv(gym.Env):
         self.max_x                   = 0.0
         self.total_damage            = 0.0
         self.episode_start_time      = time.time()
-        self.steps_without_progress   = 0
+        self.steps_without_descent    = 0
         self.visited_chunks           = set()
         self.route_x                  = []
         self.route_y                  = []
@@ -321,23 +321,34 @@ class NoitaEnv(gym.Env):
                 )
 
         # ── Reward ────────────────────────────────────────────────────────────
-        # Design goal: reward ANY movement away from spawn, not just descent.
-        # The old code only rewarded +Δy and punished standing still with -10,
-        # which killed the agent for walking down a horizontal corridor.
-        reward = -0.001  # very small time tax (was -0.005)
+        # Design goal: ONLY vertical descent gives positive reward.
+        # Horizontal wandering without descent is penalised so the agent cannot
+        # exploit the Manhattan-distance reward by pacing left/right.
+        reward = -0.001  # small time tax
 
-        # 1. Manhattan progress from spawn (rewards lateral movement too)
+        # Track max_spawn_distance for logging/callbacks (no reward signal).
         dist = abs(current_x - self.spawn_x) + abs(current_y - self.spawn_y)
         if dist > self.max_spawn_distance:
-            reward += (dist - self.max_spawn_distance) * 0.02
             self.max_spawn_distance = dist
-            self.steps_without_progress = 0
-        else:
-            self.steps_without_progress += 1
 
-        # 2. Strong curiosity bonus for new 32×32 chunks — but only underground.
-        # JETPACK_HOLD lets the agent fly to the ceiling; without this gate it would
-        # farm chunk reward by exploring the open surface biome.
+        # 1. Vertical depth is the ONLY positive progress signal.
+        #    current_y increases as the agent goes deeper (Noita: +Y = down).
+        if current_y > self.max_depth_y:
+            reward += (current_y - self.max_depth_y) * 0.025
+            self.max_depth_y = current_y
+            self.steps_without_descent = 0
+        else:
+            self.steps_without_descent += 1
+            # Horizontal penalty: lateral movement without descent is penalised.
+            # Proportional to |vx| so small drift is forgiven but sustained
+            # left/right pacing gets a clear negative signal.
+            vx_raw = abs(state.get("vx", 0.0))
+            if vx_raw > 20.0:
+                reward -= 0.003
+
+        # 2. Chunk curiosity — only underground (sky-farm guard) and only when
+        #    the chunk is strictly deeper than the episode start to keep it
+        #    aligned with the vertical objective.
         chunk = (int(current_x // 32), int(current_y // 32))
         if chunk not in self.visited_chunks:
             self.visited_chunks.add(chunk)
@@ -345,17 +356,18 @@ class NoitaEnv(gym.Env):
             if sky_vis < 0.3:
                 reward += 0.5
 
-        # 3. Small additional bonus for new depth records (preserves "go down")
-        if current_y > self.max_depth_y:
-            reward += (current_y - self.max_depth_y) * 0.02
-            self.max_depth_y = current_y
-
-        # 4. Soft truncation when no progress for ~40s real time (no penalty —
-        # truncated episodes don't bootstrap to V(s)=0 in SB3, unlike terminal).
+        # 3. Strict truncation: 300 steps (~20 s) without new depth record.
+        #    The -5.0 "cowardice" penalty creates a strong signal that idling
+        #    or lateral wandering is always worse than attempting descent.
         truncated = False
-        if self.steps_without_progress > 600:
-            logger.info("[env:{}] Ep truncated (no progress for 600 steps).", self.port)
+        if self.steps_without_descent > 300:
+            reward -= 5.0
             truncated = True
+            self._send_action(-1)   # signal Lua: force-respawn immediately
+            logger.info(
+                "[env:{}] Truncated — no descent for 300 steps. Cowardice penalty -5.",
+                self.port,
+            )
 
         # 5. Damage / kills (kept, milder)
         if current_hp < self.last_hp:
@@ -495,7 +507,7 @@ class NoitaEnv(gym.Env):
                 "noita/chests_opened":          int(self.last_chests),
                 "noita/total_damage":           float(self.total_damage),
                 "noita/run_time_s":             float(run_time),
-                "noita/steps_without_progress": int(self.steps_without_progress),
+                "noita/steps_without_descent":  int(self.steps_without_descent),
                 "noita/death_reason":           reason,
                 "noita/route_x":                self.route_x,
                 "noita/route_y":                self.route_y,
