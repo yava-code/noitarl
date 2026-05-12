@@ -96,8 +96,9 @@ class NoitaMonitorCallback(BaseCallback):
         notifier.register_command("plot",       self._cmd_plot,       "Send reward and episode length plot")
         notifier.register_command("best",       self._cmd_best,       "Show best runs (Hall of Fame)")
         notifier.register_command("sysinfo",    self._cmd_sysinfo,    "Show system CPU and RAM usage")
-        notifier.register_command("logs",    self._cmd_logs,    "Tail the latest run logs")
-        notifier.register_command("help",    self._cmd_help,    "Show help message")
+        notifier.register_command("logs",   self._cmd_logs,   "Tail the latest run logs")
+        notifier.register_command("record", self._cmd_record, "Record ~15s clip of current gameplay")
+        notifier.register_command("help",   self._cmd_help,   "Show help message")
 
     # ── SB3 lifecycle ─────────────────────────────────────────────────────────
 
@@ -409,6 +410,29 @@ class NoitaMonitorCallback(BaseCallback):
         console.print(t)
 
     # ── Telegram commands ─────────────────────────────────────────────────────
+
+    def _cmd_record(self) -> None:
+        if self._recorder is None:
+            self._tg.send_text("⚠️ VideoRecorder is not running.")
+            return
+        if not self._recorder.is_idle:
+            self._tg.send_text("⏳ Recorder is busy — try again in ~20 seconds.")
+            return
+        ctx = {
+            "episode": self._total_episodes,
+            "steps":   self._ep_lengths[-1]   if self._ep_lengths   else 0,
+            "reward":  self._ep_rewards[-1]   if self._ep_rewards   else 0.0,
+            "dist":    self._best_spawn_distance,
+            "depth":   float(max(self._ep_depths))   if self._ep_depths   else 0.0,
+            "kills":   self._session_kills,
+            "chunks":  self._ep_chunks[-1]    if self._ep_chunks    else 0,
+        }
+        self._recorder.force_trigger("manual_record", ctx)
+        self._tg.send_text(
+            "🎥 <b>Recording started!</b>\n"
+            "Capturing 5s pre-roll + 5s live + 5s post.\n"
+            "Clip will arrive in ~15 seconds."
+        )
 
     def _cmd_stop(self) -> None:
         logger.warning("Stop command received via Telegram")

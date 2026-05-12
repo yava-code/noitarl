@@ -41,8 +41,19 @@ import numpy as np
 import websockets
 import gymnasium as gym
 from loguru import logger
-import mss
 from PIL import Image
+
+
+def _capture_noita_frame() -> "Optional[Image.Image]":
+    """Capture current Noita game frame via PrintWindow — works in background."""
+    try:
+        from video_recorder import VideoRecorder  # lazy import, no circular dep
+        hwnd = VideoRecorder._find_noita_hwnd()
+        if hwnd is None:
+            return None
+        return VideoRecorder._print_window(hwnd)
+    except Exception:
+        return None
 
 
 class NoitaEnv(gym.Env):
@@ -89,7 +100,6 @@ class NoitaEnv(gym.Env):
         self.route_y: list[float] = []
         self.action_history: list[int] = []
 
-        self.sct = mss.mss()
         self.frame_buffer = collections.deque(maxlen=30)
         self.gif_skip = 0
 
@@ -282,25 +292,14 @@ class NoitaEnv(gym.Env):
         current_hp = state.get("hp", 0.0)
         dead       = state.get("dead", False)
 
-        # Capture frames for end-of-episode GIF — Noita window, not whole monitor
+        # Capture frames for end-of-episode GIF via PrintWindow (works in background)
         self.gif_skip += 1
         if self.gif_skip >= 2:  # every 2 steps ≈ 7.5 FPS
             self.gif_skip = 0
-            try:
-                import pygetwindow as gw
-                wins = gw.getWindowsWithTitle("Noita")
-                if wins and wins[0].width > 50:
-                    w = wins[0]
-                    mon = {"top": max(0, w.top), "left": max(0, w.left),
-                           "width": w.width, "height": w.height}
-                    sct_img = self.sct.grab(mon)
-                else:
-                    sct_img = self.sct.grab(self.sct.monitors[1])
-                img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+            img = _capture_noita_frame()
+            if img is not None:
                 img.thumbnail((640, 360), Image.Resampling.LANCZOS)
                 self.frame_buffer.append(img)
-            except Exception:
-                pass
 
         # Portal teleport detection — sudden large Δposition between frames is a
         # holy-mountain teleporter trigger (real walking caps at ~60 px/step).
@@ -481,30 +480,23 @@ class NoitaEnv(gym.Env):
             
             screenshot_bytes = None
             try:
-                import pygetwindow as gw
-                wins = gw.getWindowsWithTitle("Noita")
-                if wins and wins[0].width > 50:
-                    w = wins[0]
-                    mon = {"top": max(0, w.top), "left": max(0, w.left),
-                           "width": w.width, "height": w.height}
-                    sct_img = self.sct.grab(mon)
-                else:
-                    sct_img = self.sct.grab(self.sct.monitors[1])
-                img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
-                buf = io.BytesIO()
-                img.save(buf, format="PNG")
-                screenshot_bytes = buf.getvalue()
+                img = _capture_noita_frame()
+                if img is not None:
+                    buf = io.BytesIO()
+                    img.save(buf, format="PNG")
+                    screenshot_bytes = buf.getvalue()
             except Exception as exc:
                 logger.debug("[env:{}] Screenshot failed: {}", self.port, exc)
 
             gif_bytes = None
             try:
                 if len(self.frame_buffer) > 5:
-                    import io
-                    buf = io.BytesIO()
-                    # frame_buffer is a deque of PIL images
                     frames = list(self.frame_buffer)
-                    frames[0].save(buf, format="GIF", save_all=True, append_images=frames[1:], duration=100, loop=0)
+                    buf = io.BytesIO()
+                    pal = frames[0].quantize(colors=255, method=Image.Quantize.FASTOCTREE)
+                    q = [f.quantize(palette=pal, dither=1) for f in frames]
+                    q[0].save(buf, format="GIF", save_all=True,
+                              append_images=q[1:], duration=100, loop=0, optimize=False)
                     gif_bytes = buf.getvalue()
                     self.frame_buffer.clear()
             except Exception as exc:

@@ -73,9 +73,11 @@ _EVENT_HASHTAG: dict[str, str] = {
     "long_survival":        "#BotGaming",
     "high_episode_reward":  "#Milestone",
     "wand_kill":            "#KillSpree",
+    "manual_record":        "#BotGaming",
 }
 
 _DESCRIPTIONS: dict[str, str] = {
+    "manual_record":        "Manual recording — ep={episode} steps={steps} reward={reward:.1f} dist={dist:.0f}px",
     "portal_teleport":      "Agent found a Holy Mountain portal and teleported to the next level! dist={dist:.0f}px",
     "new_distance_record":  "New distance record: {dist:.0f}px from spawn! depth={depth:.0f}px",
     "new_depth_record":     "New depth record: {depth:.0f}px underground! ep={episode}",
@@ -166,6 +168,16 @@ class VideoRecorder:
             return
         self._event_q.put_nowait({"name": event_name, "ctx": context, "t": now})
 
+    def force_trigger(self, event_name: str, context: dict) -> None:
+        """Like trigger_event but bypasses the cooldown timer (for /record command)."""
+        self._event_q.put_nowait({"name": event_name, "ctx": context, "t": time.monotonic()})
+
+    @property
+    def is_idle(self) -> bool:
+        """True when the recorder is idle and ready for a new trigger."""
+        with self._state_lock:
+            return self._state == "idle"
+
     # ── Capture thread ────────────────────────────────────────────────────────
 
     def _capture_loop(self) -> None:
@@ -204,31 +216,49 @@ class VideoRecorder:
 
     @staticmethod
     def _find_noita_hwnd() -> Optional[int]:
-        """Return HWND of the first visible Noita window (any title variant)."""
+        """
+        Return HWND of the Noita game window, identified by process executable
+        name (noita.exe / noita_dev.exe) — NOT by window title, so browser tabs
+        named 'noita-rl-...' are never mistakenly matched.
+        """
         try:
             import ctypes
             import ctypes.wintypes as wt
+
+            k32   = ctypes.windll.kernel32
+            user32 = ctypes.windll.user32
+            PROCESS_QUERY_LIMITED = 0x1000
 
             found: list = []
 
             @ctypes.WINFUNCTYPE(ctypes.c_bool, wt.HWND, wt.LPARAM)
             def _cb(hwnd, _):
-                if not ctypes.windll.user32.IsWindowVisible(hwnd):
+                if not user32.IsWindowVisible(hwnd):
                     return True
-                ln = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
-                if not ln:
+                pid = wt.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                if not pid.value:
                     return True
-                buf = ctypes.create_unicode_buffer(ln + 1)
-                ctypes.windll.user32.GetWindowTextW(hwnd, buf, ln + 1)
-                if "noita" in buf.value.lower():
-                    rect = wt.RECT()
-                    ctypes.windll.user32.GetClientRect(hwnd, ctypes.byref(rect))
-                    if rect.right >= 50 and rect.bottom >= 50:
-                        found.append(int(hwnd))
-                        return False
+                hproc = k32.OpenProcess(PROCESS_QUERY_LIMITED, False, pid.value)
+                if not hproc:
+                    return True
+                try:
+                    buf  = ctypes.create_unicode_buffer(260)
+                    size = ctypes.c_uint32(260)
+                    if k32.QueryFullProcessImageNameW(hproc, 0, buf, ctypes.byref(size)):
+                        # Match only the exe filename, not the full path or window title
+                        exe = buf.value.lower().rsplit("\\", 1)[-1]
+                        if exe in ("noita.exe", "noita_dev.exe"):
+                            rect = wt.RECT()
+                            user32.GetClientRect(hwnd, ctypes.byref(rect))
+                            if rect.right >= 50 and rect.bottom >= 50:
+                                found.append(int(hwnd))
+                                return False  # stop after first match
+                finally:
+                    k32.CloseHandle(hproc)
                 return True
 
-            ctypes.windll.user32.EnumWindows(_cb, 0)
+            user32.EnumWindows(_cb, 0)
             return found[0] if found else None
         except Exception:
             return None
@@ -530,5 +560,9 @@ class VideoRecorder:
                 f"{text}\n{_EVENT_HASHTAG.get(event_name, '#BotGaming')}"
             )
         except Exception as exc:
-            logger.debug("VideoRecorder: Groq failed: {}", exc)
+            s = str(exc).lower()
+            if any(k in s for k in ("429", "quota", "rate_limit", "insufficient_quota")):
+                logger.warning("VideoRecorder: Groq quota/rate-limit — using fallback caption")
+            else:
+                logger.debug("VideoRecorder: Groq failed: {}", exc)
             return fallback

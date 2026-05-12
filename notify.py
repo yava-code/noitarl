@@ -35,9 +35,10 @@ class TelegramNotifier:
         self._commands_desc: list[dict] = []
         self._stats_fn: Optional[Callable[[], str]] = None  # injected by callback
         self._buttons_row_1 = [
-            {"text": "📊 Status", "callback_data": "status"},
-            {"text": "📈 Plot", "callback_data": "plot"},
-            {"text": "📸 Screen", "callback_data": "screen"}
+            {"text": "📊 Status",  "callback_data": "status"},
+            {"text": "📈 Plot",    "callback_data": "plot"},
+            {"text": "📸 Screen",  "callback_data": "screen"},
+            {"text": "🎥 Record",  "callback_data": "record"},
         ]
         self._buttons_row_2 = [
             {"text": "🏆 Best", "callback_data": "best"},
@@ -98,12 +99,14 @@ class TelegramNotifier:
         if not self._enabled:
             return False
         try:
-            data = {"chat_id": self._chat_id, "caption": caption}
+            import json as _json
+            data = {"chat_id": self._chat_id, "caption": caption, "parse_mode": "HTML"}
             if reply_markup is None:
-                data["reply_markup"] = '{"inline_keyboard": [[{"text": "📊 Status", "callback_data": "status"}, {"text": "📈 Plot", "callback_data": "plot"}, {"text": "📸 Screen", "callback_data": "screen"}], [{"text": "🏆 Best", "callback_data": "best"}, {"text": "🖥 SysInfo", "callback_data": "sysinfo"}, {"text": "📄 Logs", "callback_data": "logs"}], [{"text": "📦 Model", "callback_data": "checkpoint"}, {"text": "🔕 Mute", "callback_data": "mute"}, {"text": "⏹ Stop", "callback_data": "stop"}]]}'
+                data["reply_markup"] = _json.dumps({
+                    "inline_keyboard": [self._buttons_row_1, self._buttons_row_2, self._buttons_row_3]
+                })
             elif reply_markup:
-                import json
-                data["reply_markup"] = json.dumps(reply_markup)
+                data["reply_markup"] = _json.dumps(reply_markup)
 
             with open(file_path, "rb") as f:
                 r = requests.post(
@@ -121,12 +124,14 @@ class TelegramNotifier:
         if not self._enabled:
             return False
         try:
+            import json as _json
             data = {"chat_id": self._chat_id, "caption": caption}
             if reply_markup is None:
-                data["reply_markup"] = '{"inline_keyboard": [[{"text": "📊 Status", "callback_data": "status"}, {"text": "📈 Plot", "callback_data": "plot"}, {"text": "📸 Screen", "callback_data": "screen"}], [{"text": "🏆 Best", "callback_data": "best"}, {"text": "🖥 SysInfo", "callback_data": "sysinfo"}, {"text": "📄 Logs", "callback_data": "logs"}], [{"text": "📦 Model", "callback_data": "checkpoint"}, {"text": "🔕 Mute", "callback_data": "mute"}, {"text": "⏹ Stop", "callback_data": "stop"}]]}'
+                data["reply_markup"] = _json.dumps({
+                    "inline_keyboard": [self._buttons_row_1, self._buttons_row_2, self._buttons_row_3]
+                })
             elif reply_markup:
-                import json
-                data["reply_markup"] = json.dumps(reply_markup)
+                data["reply_markup"] = _json.dumps(reply_markup)
 
             r = requests.post(
                 f"{self._base}/sendPhoto",
@@ -221,31 +226,48 @@ class TelegramNotifier:
 
     @staticmethod
     def _find_noita_hwnd() -> Optional[int]:
-        """Return HWND of the first visible Noita window (covers noita_dev.exe too)."""
+        """
+        Return HWND of the Noita game window, matched by process executable
+        (noita.exe / noita_dev.exe) so browser tabs with 'noita' in their title
+        are never accidentally selected.
+        """
         try:
             import ctypes
             import ctypes.wintypes as wt
+
+            k32    = ctypes.windll.kernel32
+            user32 = ctypes.windll.user32
+            PROCESS_QUERY_LIMITED = 0x1000
 
             found: list = []
 
             @ctypes.WINFUNCTYPE(ctypes.c_bool, wt.HWND, wt.LPARAM)
             def _cb(hwnd, _):
-                if not ctypes.windll.user32.IsWindowVisible(hwnd):
+                if not user32.IsWindowVisible(hwnd):
                     return True
-                ln = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
-                if not ln:
+                pid = wt.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                if not pid.value:
                     return True
-                buf = ctypes.create_unicode_buffer(ln + 1)
-                ctypes.windll.user32.GetWindowTextW(hwnd, buf, ln + 1)
-                if "noita" in buf.value.lower():
-                    rect = wt.RECT()
-                    ctypes.windll.user32.GetClientRect(hwnd, ctypes.byref(rect))
-                    if rect.right >= 50 and rect.bottom >= 50:
-                        found.append(int(hwnd))
-                        return False
+                hproc = k32.OpenProcess(PROCESS_QUERY_LIMITED, False, pid.value)
+                if not hproc:
+                    return True
+                try:
+                    buf  = ctypes.create_unicode_buffer(260)
+                    size = ctypes.c_uint32(260)
+                    if k32.QueryFullProcessImageNameW(hproc, 0, buf, ctypes.byref(size)):
+                        exe = buf.value.lower().rsplit("\\", 1)[-1]
+                        if exe in ("noita.exe", "noita_dev.exe"):
+                            rect = wt.RECT()
+                            user32.GetClientRect(hwnd, ctypes.byref(rect))
+                            if rect.right >= 50 and rect.bottom >= 50:
+                                found.append(int(hwnd))
+                                return False
+                finally:
+                    k32.CloseHandle(hproc)
                 return True
 
-            ctypes.windll.user32.EnumWindows(_cb, 0)
+            user32.EnumWindows(_cb, 0)
             return found[0] if found else None
         except Exception:
             return None
