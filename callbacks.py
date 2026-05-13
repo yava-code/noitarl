@@ -98,6 +98,7 @@ class NoitaMonitorCallback(BaseCallback):
         notifier.register_command("sysinfo",    self._cmd_sysinfo,    "Show system CPU and RAM usage")
         notifier.register_command("logs",   self._cmd_logs,   "Tail the latest run logs")
         notifier.register_command("record", self._cmd_record, "Record ~15s clip of current gameplay")
+        notifier.register_command("debug",  self._cmd_debug,  "Show current reward breakdown & recent episode stats")
         notifier.register_command("help",   self._cmd_help,   "Show help message")
 
     # ── SB3 lifecycle ─────────────────────────────────────────────────────────
@@ -225,8 +226,8 @@ class NoitaMonitorCallback(BaseCallback):
                 # Kill spree
                 if kills >= 3:
                     rec.trigger_event("kill_spree", ctx)
-                # Death after long run
-                if death_reason == "DEAD" and l >= 300:
+                # Death after long run — high threshold so routine deaths don't spam
+                if death_reason == "DEAD" and l >= 600:
                     rec.trigger_event("death_long_run", ctx)
                 # Visually stuck
                 if visually_stuck:
@@ -429,6 +430,33 @@ class NoitaMonitorCallback(BaseCallback):
             "Capturing 5s pre-roll + 5s live + 5s post.\n"
             "Clip will arrive in ~15 seconds."
         )
+
+    def _cmd_debug(self) -> None:
+        elapsed = time.time() - self._start_ts
+        current_ep_steps = self.num_timesteps - self._current_ep_start_step
+
+        last5r = list(self._ep_rewards)[-5:] if self._ep_rewards else []
+        last5d = list(self._ep_depths)[-5:]  if self._ep_depths  else []
+        last5l = list(self._ep_lengths)[-5:] if self._ep_lengths else []
+
+        r_str = " ".join(f"{v:.1f}" for v in last5r) or "–"
+        d_str = " ".join(f"{v:.0f}" for v in last5d) or "–"
+        l_str = " ".join(str(v)    for v in last5l) or "–"
+
+        msg = (
+            f"🔬 <b>Debug snapshot</b>\n\n"
+            f"Global step: {self.num_timesteps:,}\n"
+            f"Total episodes: {self._total_episodes:,}\n"
+            f"Current ep steps: {current_ep_steps:,}\n"
+            f"Session kills: {self._session_kills:,}\n"
+            f"Deaths / Timeouts: {self._session_deaths} / {self._session_timeouts}\n"
+            f"Best distance: {self._best_spawn_distance:.0f} px\n\n"
+            f"<b>Last 5 ep rewards:</b> {r_str}\n"
+            f"<b>Last 5 ep depths:</b>  {d_str}\n"
+            f"<b>Last 5 ep lengths:</b> {l_str}\n\n"
+            f"<i>Tip: set log level to DEBUG in train.py to see per-step reward breakdown.</i>"
+        )
+        self._tg.send_text(msg)
 
     def _cmd_stop(self) -> None:
         logger.warning("Stop command received via Telegram")

@@ -136,6 +136,11 @@ local virtual_hp     = VIRTUAL_MAX_HP
 local chests_opened_total = 0    -- across all episodes this session
 local chests_opened_ep    = 0    -- reset each episode
 
+-- ── Last-frame cached state for HUD (updated each action frame) ──────────
+local hud_vhp      = VIRTUAL_MAX_HP
+local hud_sky      = 0.0
+local hud_portal   = 1.0   -- portal[1] = dist_norm
+
 -- ── Per-frame state ───────────────────────────────────────────────────────
 -- Discrete 10 action space:
 --   0 IDLE | 1 LEFT | 2 RIGHT | 3 JUMP | 4 L+JUMP | 5 R+JUMP
@@ -705,8 +710,13 @@ function OnWorldPostUpdate()
         local act = ACTION_NAMES[pending_action] or "?"
         GuiColorSetForNextWidget(gui, 0.4, 1, 0.4, 1)
         GuiText(gui, 10, 10, string.format(
-            "RL AGENT  Ep:%-3d  Step:%-5d  %-5s  fps:%.0f",
-            episode_num, episode_steps, act, fps))
+            "RL AGENT  Ep:%-3d  Step:%-4d/%-4d  %-5s  fps:%.0f",
+            episode_num, episode_steps, MAX_EP_STEPS, act, fps))
+        -- Second HUD line: internal state for visual debugging (updated from last action frame)
+        GuiColorSetForNextWidget(gui, 0.9, 0.9, 0.4, 1)
+        GuiText(gui, 10, 20, string.format(
+            "  vhp:%.2f  sky:%.2f  portal:%.2f",
+            hud_vhp, hud_sky, hud_portal))
     end
     GuiColorSetForNextWidget(gui, 1, 1, 1, 1)
     GuiIdPop(gui)
@@ -848,6 +858,8 @@ function OnWorldPostUpdate()
     local jetpack_fuel     = get_jetpack_fuel(player)
     local wand_ready       = get_wand_ready(player)
 
+    hud_portal = portal_signal[1]   -- dist_norm: 1=no portal, 0=at portal
+
     -- Fire: read DamageModelComponent.is_on_fire (the engine sets this directly).
     -- The GameEffect "ON_FIRE" doesn't exist in Noita — burning is a stain/material
     -- contact, not a game effect, so GameGetGameEffectCount always returned 0.
@@ -865,6 +877,10 @@ function OnWorldPostUpdate()
     -- Sky visibility: 1=open sky, 0=deep underground (depth proxy)
     local sky_ok, sky_v = pcall(GameGetSkyVisibility, x, y)
     local sky_visibility = (sky_ok and sky_v) and math.max(0.0, math.min(1.0, sky_v)) or 0.0
+
+    -- Update HUD cache (values from this action frame shown next GUI frame)
+    hud_vhp    = virtual_hp
+    hud_sky    = sky_visibility
 
     -- Auto-open nearby chests BEFORE building state (so the frame that triggers
     -- opening is reported with the updated chests_opened_ep counter).

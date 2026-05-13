@@ -155,6 +155,19 @@ Each Noita instance needs a unique port. Edit `port.txt` in each copy's mod fold
 python train_multi.py --envs 2 --port 5001
 ```
 
+> ⚠️ **Save directory isolation is mandatory.** Two Noita instances sharing the same
+> `%APPDATA%\LocalLow\Nolla_Games_Noita\` folder will corrupt each other's world files
+> (trees flying, missing floor tiles, physics explosions). Each instance must run from
+> a **separate copy of the Noita installation directory** so saves go to different paths.
+> If isolation is impossible, use single-env `train.py` instead.
+
+> ⚠️ **Overfitting to one world seed.** The mod uses teleport-respawn so Noita never
+> restarts during a training session. The agent learns the same procedurally-generated
+> world every episode. This is expected: the policy learns to exploit a single layout,
+> which looks impressive for demos but won't generalise to a new seed. If generalization
+> matters, restart Noita periodically (which triggers a world re-roll) and let the
+> `connection_retry_interval` reconnect logic handle the gap.
+
 Resume from checkpoint:
 ```bash
 python train_multi.py --envs 2 --resume checkpoints/noita_ppo_2env_400000_steps.zip

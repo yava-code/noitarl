@@ -117,6 +117,7 @@ class VideoRecorder:
     FRAME_W       = 640         # rescale width
     FRAME_H       = 400         # rescale height
     SAVE_DIR      = "data/highlights"
+    MAX_LOCAL_GIFS = 100        # keep only the last N most interesting/recent gifs locally
 
     def __init__(self, notifier, groq_api_key: str = ""):
         self._notifier   = notifier
@@ -421,11 +422,37 @@ class VideoRecorder:
             len(all_frames), len(pre), len(live), len(post),
         )
 
+        # Check frame diversity: if all frames look the same (agent stuck / respawn screen)
+        # the GIF will show as a static photo in Telegram. Skip TG send in that case.
+        import numpy as _np
+        _send_to_tg = True
+        if len(all_frames) >= 2:
+            try:
+                _a = _np.array(all_frames[0]).astype(float)
+                _b = _np.array(all_frames[len(all_frames) // 2]).astype(float)
+                _frame_diff = _np.mean(_np.abs(_a - _b))
+                if _frame_diff < 5.0:
+                    logger.info(
+                        "VideoRecorder: frames are static (diff={:.2f}), saving locally but skipping TG for '{}'",
+                        _frame_diff, event_name,
+                    )
+                    _send_to_tg = False
+            except Exception:
+                pass
+
         try:
             gif_bytes = self._make_gif(all_frames)
         except Exception as exc:
             logger.error("VideoRecorder: GIF creation failed: {}", exc)
             return
+
+        # Too-small GIF = effectively a single frame (e.g. all frames identical after LZW)
+        if len(gif_bytes) < 8_000:
+            logger.info(
+                "VideoRecorder: GIF too small ({} bytes), likely static — saving locally, skipping TG",
+                len(gif_bytes),
+            )
+            _send_to_tg = False
 
         # Save locally
         try:
@@ -434,6 +461,10 @@ class VideoRecorder:
             logger.info("VideoRecorder: saved {} ({:.1f} MB)", gif_path, len(gif_bytes) / 1e6)
         except Exception as exc:
             logger.warning("VideoRecorder: save failed: {}", exc)
+
+        if not _send_to_tg:
+            self._cleanup_local_storage()
+            return
 
         # AI caption
         description = self._groq_describe(event_name, context)
@@ -452,6 +483,35 @@ class VideoRecorder:
                 self._notifier.send_document(gif_path, caption=caption)
             except Exception as exc2:
                 logger.warning("VideoRecorder: TG send failed: {}", exc2)
+
+        # Local cleanup: keep only the most recent/relevant files
+        self._cleanup_local_storage()
+
+    def _cleanup_local_storage(self) -> None:
+        """Keep the local folder size under control by deleting older/less interesting highlights."""
+        try:
+            files = []
+            for f in os.listdir(self.SAVE_DIR):
+                if not f.endswith(".gif"):
+                    continue
+                path = os.path.join(self.SAVE_DIR, f)
+                files.append((path, os.path.getmtime(path)))
+
+            if len(files) <= self.MAX_LOCAL_GIFS:
+                return
+
+            # Sort by modification time (oldest first)
+            files.sort(key=lambda x: x[1])
+
+            to_delete = len(files) - self.MAX_LOCAL_GIFS
+            for i in range(to_delete):
+                try:
+                    os.remove(files[i][0])
+                except Exception:
+                    pass
+            logger.info("VideoRecorder: cleaned up {} old local highlights", to_delete)
+        except Exception as exc:
+            logger.debug("VideoRecorder: cleanup failed: {}", exc)
 
     def _make_gif(self, frames: list) -> bytes:
         buf = io.BytesIO()

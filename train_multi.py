@@ -79,6 +79,12 @@ def train(n_envs: int, base_port: int, total_steps: int, resume: str | None, fre
 
     ports = [base_port + i for i in range(n_envs)]
     logger.info("Starting {} envs on ports {}", n_envs, ports)
+    logger.warning(
+        "Multi-env: each Noita instance MUST run from a SEPARATE installation directory "
+        "(different %%APPDATA%%\\LocalLow\\Nolla_Games_Noita save paths). "
+        "Two instances sharing the same save folder will corrupt the world (trees flying, "
+        "holes in floor). If you see this, use train.py (single-env) instead."
+    )
 
     env = SubprocVecEnv([make_env(p) for p in ports])
     # Note: SubprocVecEnv forks processes so set_recorder can't propagate.

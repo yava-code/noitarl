@@ -320,85 +320,119 @@ class NoitaEnv(gym.Env):
                     self.port, current_x - prev_x, current_y - prev_y,
                 )
 
+        # ── Post-teleport spawn reset (Holy Mountain) ─────────────────────────
+        # After entering a Holy Mountain portal, the agent lands in a new area
+        # where previous depth/distance records are irrelevant. Reset the origin
+        # so Manhattan + depth rewards fire fresh from the new location.
+        if portal_teleport_reward > 0:
+            self.spawn_x            = current_x
+            self.spawn_y            = current_y
+            self.max_spawn_distance = 0.0
+            self.max_depth_y        = current_y
+            self.visited_chunks     = set()
+            self.steps_without_descent = 0
+            logger.info(
+                "[env:{}] Post-portal spawn reset → ({:.0f}, {:.0f})",
+                self.port, current_x, current_y,
+            )
+
         # ── Reward ────────────────────────────────────────────────────────────
-        reward = -0.001  # small time tax
+        r_time   = -0.001  # small time tax
 
         # 1. Manhattan progress: rewards any movement that expands the frontier,
         #    giving the agent a dense signal while it learns the topology.
+        r_manh = 0.0
         dist = abs(current_x - self.spawn_x) + abs(current_y - self.spawn_y)
         if dist > self.max_spawn_distance:
-            reward += (dist - self.max_spawn_distance) * 0.015
+            r_manh = (dist - self.max_spawn_distance) * 0.015
             self.max_spawn_distance = dist
 
         # 2. Depth — weighted 2× higher than Manhattan so the agent prefers
         #    going DOWN over going sideways at the same speed.
+        r_depth = 0.0
         if current_y > self.max_depth_y:
-            reward += (current_y - self.max_depth_y) * 0.03
+            r_depth = (current_y - self.max_depth_y) * 0.03
             self.max_depth_y = current_y
             self.steps_without_descent = 0
         else:
             self.steps_without_descent += 1
 
         # 3. Chunk curiosity — underground only (sky-farm guard).
+        r_chunk = 0.0
         chunk = (int(current_x // 32), int(current_y // 32))
         if chunk not in self.visited_chunks:
             self.visited_chunks.add(chunk)
             sky_vis = float(state.get("sky_visibility", 0.0))
             if sky_vis < 0.3:
-                reward += 0.5
+                r_chunk = 0.5
 
         # 4. Truncation: no depth progress for 500 steps (~33 s).
-        #    Mild penalty so the agent prefers any movement over total stagnation,
-        #    but not so harsh that it makes IDLE the safest policy.
         truncated = False
+        r_trunc = 0.0
         if self.steps_without_descent > 500:
-            reward -= 2.0
+            r_trunc = -2.0
             truncated = True
-            self._send_action(-1)   # tell Lua to respawn immediately
+            self._send_action(-1)
             logger.info(
                 "[env:{}] Truncated — no descent for 500 steps (-2 penalty).",
                 self.port,
             )
 
-        # 5. Damage / kills (kept, milder)
+        # 5. Damage / kills
+        r_dmg = 0.0
         if current_hp < self.last_hp:
             damage = self.last_hp - current_hp
-            reward -= damage * 1.0
+            r_dmg = -damage * 1.0
             self.total_damage += damage
 
         self.max_x = max(self.max_x, current_x)
 
+        r_kills = 0.0
         current_kills = state.get("kills", 0)
         if current_kills > self.last_kills:
-            reward += (current_kills - self.last_kills) * 5.0
+            r_kills = (current_kills - self.last_kills) * 5.0
         self.last_kills = current_kills
 
-        # Chest opened by Lua auto-open (agent was close enough → EntityKill)
+        r_chests = 0.0
         current_chests = state.get("chests", 0)
         if current_chests > self.last_chests:
-            reward += (current_chests - self.last_chests) * 3.0
+            r_chests = (current_chests - self.last_chests) * 3.0
         self.last_chests = current_chests
 
-        # 5b. Aim-on-enemy bonus: small reward when FIRE pressed AND an enemy is in
-        # 250 px. Closes the gap between "I pulled the trigger" and the rare +5/kill.
-        # Capped below chunk reward so curiosity isn't overridden.
+        # 5b. Aim-on-enemy bonus: tiny reward when FIRE pressed AND enemy in 250 px.
+        # Kept very small (0.01) so it can't be farmed — at 0.05 agents stand
+        # still and shoot indefinitely to accumulate this bonus instead of exploring.
+        r_fire = 0.0
         if int(action) in (6, 7):
             enemy_radar = state.get("enemy_radar", [1.0] * 8)
             if any(v < 0.9 for v in enemy_radar):
-                reward += 0.05
+                r_fire = 0.01
 
         # 5c. Portal proximity bonus + one-shot teleport reward (Holy Mountain).
+        r_portal = 0.0
         portal = state.get("portal", [1.0, 0.5, 0.5])
         if isinstance(portal, list) and len(portal) == 3:
             portal_dist = float(portal[0])
             if portal_dist < 0.3:
-                # Smooth gradient pulling the agent into the portal.
-                reward += (0.3 - portal_dist) * 0.05
-        reward += portal_teleport_reward
+                r_portal = (0.3 - portal_dist) * 0.05
+        r_portal += portal_teleport_reward
 
-        # 6. Death penalty — mild so the agent doesn't become risk-averse
+        # 6. Death penalty
+        r_death = 0.0
         if dead and current_hp <= 0:
-            reward -= 1.0
+            r_death = -1.0
+
+        reward = r_time + r_manh + r_depth + r_chunk + r_trunc + r_dmg + r_kills + r_chests + r_fire + r_portal + r_death
+
+        # Debug: log reward breakdown every 50 steps so we can see what's driving the policy
+        if self.episode_steps % 50 == 0:
+            logger.debug(
+                "[env:{}] reward breakdown: time={:+.3f} manh={:+.3f} depth={:+.3f}"
+                " chunk={:+.2f} fire={:+.2f} portal={:+.3f} kills={:+.1f}"
+                " dmg={:+.2f} death={:+.1f} total={:+.4f}",
+                self.port, r_time, r_manh, r_depth, r_chunk, r_fire, r_portal,
+                r_kills, r_dmg, r_death, reward,
+            )
 
         self.last_hp         = current_hp
         self.episode_steps  += 1
@@ -469,12 +503,23 @@ class NoitaEnv(gym.Env):
             wy = self.route_y[-200:]
             if max(wx) - min(wx) < 20 and max(wy) - min(wy) < 20:
                 visually_stuck = True
-        
+
         if len(self.action_history) >= 500:
             wa = self.action_history[-500:]
             c = Counter(wa)
-            if c.most_common(1)[0][1] > 400: # 80% of 500
+            if c.most_common(1)[0][1] > 400:  # 80% of 500 steps same action
                 action_loop = True
+
+        # Action-loop truncation: degenerate policy (e.g. fire/idle farming).
+        # 80% same action in 500 steps means the agent isn't learning anything.
+        if action_loop and not truncated:
+            reward -= 3.0
+            truncated = True
+            self._send_action(-1)
+            logger.info(
+                "[env:{}] Truncated — action loop (same action >80%% of 500 steps, -3 penalty).",
+                self.port,
+            )
 
         if dead or truncated:
             reason = "TRUNC" if truncated and not dead else "DEAD"
