@@ -109,13 +109,13 @@ class VideoRecorder:
         recorder.stop()
     """
 
-    CAPTURE_FPS   = 12          # frames per second captured
-    PRE_SEC       = 5           # seconds of pre-event footage to keep
-    RECORD_SEC    = 5           # max seconds of live recording per event
-    POST_SEC      = 5           # seconds of post-event footage to append
+    CAPTURE_FPS   = 10          # frames per second (lower → smaller GIF)
+    PRE_SEC       = 3           # seconds of pre-event footage to keep
+    RECORD_SEC    = 4           # max seconds of live recording per event
+    POST_SEC      = 3           # seconds of post-event footage to append
     COOLDOWN_SEC  = 20          # min seconds between recordings
-    FRAME_W       = 640         # rescale width
-    FRAME_H       = 400         # rescale height
+    FRAME_W       = 480         # rescale width  (was 640 → ~12MB GIFs that TG couldn't play)
+    FRAME_H       = 300         # rescale height (was 400 → now targets ~3-5MB)
     SAVE_DIR      = "data/highlights"
     MAX_LOCAL_GIFS = 100        # keep only the last N most interesting/recent gifs locally
 
@@ -178,6 +178,12 @@ class VideoRecorder:
         """True when the recorder is idle and ready for a new trigger."""
         with self._state_lock:
             return self._state == "idle"
+
+    @property
+    def status(self) -> str:
+        """Current recorder state: 'idle' | 'recording' | 'post' | 'cooldown'."""
+        with self._state_lock:
+            return self._state
 
     # ── Capture thread ────────────────────────────────────────────────────────
 

@@ -171,7 +171,9 @@ def train(args: argparse.Namespace) -> None:
         )
 
     # ── Callbacks ─────────────────────────────────────────────────────────────
+    from callbacks import NoitaMonitorCallback, ThinkingCallback
     monitor_cb = NoitaMonitorCallback(cfg, notifier, verbose=0, recorder=recorder)
+    thinking_cb = ThinkingCallback()
 
     checkpoint_cb = CheckpointCallback(
         save_freq   = max(cfg.checkpoint_freq // 1, 1),
@@ -180,7 +182,7 @@ def train(args: argparse.Namespace) -> None:
         verbose     = 1,
     )
 
-    callbacks = CallbackList([monitor_cb, checkpoint_cb])
+    callbacks = CallbackList([monitor_cb, thinking_cb, checkpoint_cb])
 
     # ── Train ─────────────────────────────────────────────────────────────────
     console.rule(f"[bold green]NoitaRL — {run_name}")

@@ -140,32 +140,49 @@ local chests_opened_ep    = 0    -- reset each episode
 local hud_vhp      = VIRTUAL_MAX_HP
 local hud_sky      = 0.0
 local hud_portal   = 1.0   -- portal[1] = dist_norm
+local hud_probs    = {}
+local hud_saliency = {}
 
 -- ── Per-frame state ───────────────────────────────────────────────────────
--- Discrete 10 action space:
---   0 IDLE | 1 LEFT | 2 RIGHT | 3 JUMP | 4 L+JUMP | 5 R+JUMP
---   6 FIRE | 7 FIRE_DOWN | 8 KICK | 9 JETPACK_HOLD
-local pending_action  = 0
-local last_action     = 0
-local last_facing     = 1     -- last non-zero horizontal direction (for KICK aim)
-local last_kick_frame = -1000
+-- Discrete 18 action space:
+--   0 IDLE | 1 L | 2 R | 3 UP | 4 UL | 5 UR
+--   6 JETPK | 7 KICK
+--   8 F_R | 9 F_UR | 10 F_U | 11 F_UL
+--   12 F_L | 13 F_DL | 14 F_D | 15 F_DR
+--   16 F_AUTO | 17 F_SMART
+local pending_action   = 0
+local last_action      = 0
+local last_facing      = 1     -- last non-zero horizontal direction (for KICK aim)
+local last_kick_frame  = -1000
+local agent_was_firing = false -- Track fire state locally so engine hardware poll doesn't break it
 local ACTION_NAMES    = {
-    [0]="IDLE", [1]="LEFT", [2]="RIGHT", [3]="JUMP",
-    [4]="L+JMP", [5]="R+JMP", [6]="FIRE", [7]="DIG_D",
-    [8]="KICK", [9]="JETPK",
+    [0]="IDLE", [1]="L", [2]="R", [3]="UP", [4]="UL", [5]="UR",
+    [6]="JETPK", [7]="KICK",
+    [8]="F_R", [9]="F_UR", [10]="F_U", [11]="F_UL",
+    [12]="F_L", [13]="F_DL", [14]="F_D", [15]="F_DR",
+    [16]="F_AUTO", [17]="F_SMART"
 }
--- Decomposition: {move_x, do_jump, do_fire, aim_down, do_kick, do_jetpack}
+-- {move_x, do_jump, do_fire, aim_type, aim_x, aim_y, do_kick, do_jetpack}
+-- aim_type: 0=move_dir, 1=fixed_vec, 2=auto_enemy, 3=smart_loot
 local ACTION_DECODE = {
-    [0]={ 0, false, false, false, false, false },
-    [1]={-1, false, false, false, false, false },
-    [2]={ 1, false, false, false, false, false },
-    [3]={ 0, true,  false, false, false, false },
-    [4]={-1, true,  false, false, false, false },
-    [5]={ 1, true,  false, false, false, false },
-    [6]={ 0, false, true,  false, false, false },
-    [7]={ 0, false, true,  true,  false, false },
-    [8]={ 0, false, false, false, true,  false },
-    [9]={ 0, false, false, false, false, true  },
+    [0] = { 0, false, false, 0, 0, 0, false, false },
+    [1] = {-1, false, false, 0, 0, 0, false, false },
+    [2] = { 1, false, false, 0, 0, 0, false, false },
+    [3] = { 0, true,  false, 0, 0, 0, false, false },
+    [4] = {-1, true,  false, 0, 0, 0, false, false },
+    [5] = { 1, true,  false, 0, 0, 0, false, false },
+    [6] = { 0, false, false, 0, 0, 0, false, true  },
+    [7] = { 0, false, false, 0, 0, 0, true,  false },
+    [8] = { 0, false, true,  1,  1,  0, false, false }, -- Fire Right
+    [9] = { 0, false, true,  1,  1, -1, false, false }, -- Fire Up-Right
+    [10]= { 0, false, true,  1,  0, -1, false, false }, -- Fire Up
+    [11]= { 0, false, true,  1, -1, -1, false, false }, -- Fire Up-Left
+    [12]= { 0, false, true,  1, -1,  0, false, false }, -- Fire Left
+    [13]= { 0, false, true,  1, -1,  1, false, false }, -- Fire Down-Left
+    [14]= { 0, false, true,  1,  0,  1, false, false }, -- Fire Down
+    [15]= { 0, false, true,  1,  1,  1, false, false }, -- Fire Down-Right
+    [16]= { 0, false, true,  2,  0,  0, false, false }, -- Auto-aim enemy
+    [17]= { 0, false, true,  3,  0,  0, false, false }, -- Smart-aim loot
 }
 local MAX_EP_STEPS    = 2000  -- ~2.2 min at 60 fps with FRAME_SKIP=4
 
@@ -209,8 +226,8 @@ local function apply_action(player, action)
     last_action = action
 
     local decode = ACTION_DECODE[action] or ACTION_DECODE[0]
-    local move_x, do_jump, do_fire, aim_down, do_kick, do_jetpack =
-        decode[1], decode[2], decode[3], decode[4], decode[5], decode[6]
+    local move_x, do_jump, do_fire, aim_type, aim_x, aim_y, do_kick, do_jetpack =
+        decode[1], decode[2], decode[3], decode[4], decode[5], decode[6], decode[7], decode[8]
 
     if move_x ~= 0 then last_facing = move_x end
 
@@ -223,15 +240,9 @@ local function apply_action(player, action)
         cur_vx = cur_vx or 0; cur_vy = cur_vy or 0
         on_ground_now = on_ground == true
 
-        -- Horizontal: set target directly (no lerp). When the agent says "go
-        -- right", it goes right on the very next physics tick.
         local target_vx = move_x * MOVE_SPEED
         local new_vx    = target_vx
-
-        -- Vertical:
-        --   Bare JUMP (3/4/5) only fires when grounded.
-        --   JETPACK_HOLD (9) adds upward Δv every tick while fuel remains.
-        local new_vy = cur_vy
+        local new_vy    = cur_vy
         if do_jump and on_ground_now then
             new_vy = JUMP_SPEED
         end
@@ -247,8 +258,7 @@ local function apply_action(player, action)
         vx_out, vy_out = new_vx, new_vy
     end
 
-    -- KICK: melee damage to enemies within KICK_RANGE in front of player.
-    -- Hand-rolled because Noita's player has no MeleeAttackComponent by default.
+    -- KICK: melee damage to enemies within KICK_RANGE
     if do_kick then
         local frame = GameGetFrameNum()
         if frame - last_kick_frame >= KICK_COOLDOWN then
@@ -260,11 +270,9 @@ local function apply_action(player, action)
                     for _, eid in ipairs(ents) do
                         local tok, ex, ey = pcall(EntityGetTransform, eid)
                         if tok then
-                            -- Front-facing hemisphere: enemy must be on the
-                            -- facing side OR within 12 px vertically (kick up/down).
                             if (ex - px) * last_facing >= -8 then
-                                pcall(EntityInflictDamage, eid, KICK_DAMAGE, "melee",
-                                    "kicked", "BLOOD", last_facing * 250, -50, player,
+                                pcall(EntityInflictDamage, eid, KICK_DAMAGE, "SLICE",
+                                    "kicked", "RAGDOLL_SOFT", last_facing * 250, -50, player,
                                     ex, ey, 200)
                             end
                         end
@@ -279,15 +287,14 @@ local function apply_action(player, action)
     if ctrl then
         local tok, px, py = pcall(EntityGetTransform, player)
         if tok then
-            local nx, ny
-            if aim_down then
-                -- Override: dig straight down (used by action 7 FIRE_DOWN)
-                nx, ny = px, py + 50
-            else
-                -- Auto-aim: nearest enemy in 250 px, else face current movement
+            local nx, ny = px + 50 * last_facing, py -- default: horizontal
+            
+            if aim_type == 1 then
+                -- Fixed vector (8 directions)
+                nx, ny = px + aim_x * 50, py + aim_y * 50
+            elseif aim_type == 2 then
+                -- Auto-aim: nearest enemy in 250 px
                 local aok, enemies = pcall(EntityGetInRadiusWithTag, px, py, 250, "enemy")
-                local face_x       = (move_x ~= 0) and move_x or 1
-                nx, ny = px + 50 * face_x, py
                 if aok and enemies and #enemies > 0 then
                     local nearest_d2 = math.huge
                     for _, eid in ipairs(enemies) do
@@ -300,13 +307,29 @@ local function apply_action(player, action)
                         end
                     end
                 end
+            elseif aim_type == 3 then
+                -- Smart-aim: nearest loot (chest or nugget)
+                local best_d2, bx, by = math.huge, nil, nil
+                local loot_tags = {"gold_nugget", "chest", "item_pickup"}
+                for _, tag in ipairs(loot_tags) do
+                    local lok, ents = pcall(EntityGetInRadiusWithTag, px, py, 200, tag)
+                    if lok and ents then
+                        for _, eid in ipairs(ents) do
+                            local eok, ex, ey = pcall(EntityGetTransform, eid)
+                            if eok then
+                                local d2 = (ex-px)^2 + (ey-py)^2
+                                if d2 < best_d2 then best_d2, bx, by = d2, ex, ey end
+                            end
+                        end
+                    end
+                end
+                if bx then nx, ny = bx, by end
             end
+
             local dx, dy = nx - px, ny - py
             local len = math.sqrt(dx*dx + dy*dy)
             if len > 0.001 then
                 local nxv, nyv = dx/len, dy/len
-                -- ControlsComponent gets pummelled by the engine's input layer each
-                -- frame; writing aim here is necessary but not sufficient.
                 cset(ctrl, "mAimingVectorNormalized", nxv, nyv)
                 cset(ctrl, "mAimingVector",           nxv * 40, nyv * 40)
                 cset(ctrl, "mMousePosition",          nx, ny)
@@ -314,35 +337,37 @@ local function apply_action(player, action)
                 cset(ctrl, "mGamePadCursorInWorld",   nx, ny)
                 cset(ctrl, "mGamepadIndirectAiming",  nxv, nyv)
 
-                -- PlatformShooterPlayerComponent owns the smoothed aim vector that
-                -- drives sprite flip + visible reticle. Without writing here, our
-                -- ControlsComponent aim is overwritten by platformshooterplayer_system.
-                -- NOTE: do NOT write mDesiredCameraPos here — that snaps the camera
-                -- to the enemy world position every frame, causing convulsions and
-                -- "allocate 64x64 failed" terrain allocation spam.
                 local pspc = EntityGetFirstComponent(player, "PlatformShooterPlayerComponent")
-                if pspc then
-                    cset(pspc, "mSmoothedAimingVector", nxv, nyv)
-                end
-
-                -- CharacterPlatformingComponent stores facing direction used by sprite.
+                if pspc then cset(pspc, "mSmoothedAimingVector", nxv, nyv) end
+                
                 local cplat = EntityGetFirstComponent(player, "CharacterPlatformingComponent")
-                if cplat then
-                    cset(cplat, "mFacingDirection", (nxv >= 0) and 1 or -1)
-                end
+                if cplat then cset(cplat, "mFacingDirection", (nxv >= 0) and 1 or -1) end
             end
         end
 
-        -- Fire: rising-edge frame stamp so cast_delay isn't reset every frame
-        local was_fire = (cget(ctrl, "mButtonDownFire") == true)
+        -- Fire: Fix "eternal first frame" bug by using local agent_was_firing
         cset(ctrl, "mButtonDownFire",      do_fire)
         cset(ctrl, "mButtonDownLeftClick", do_fire)
-        if do_fire and not was_fire then
+        
+        if do_fire and not agent_was_firing then
             local frame = GameGetFrameNum()
             cset(ctrl, "mButtonFrameFire",      frame)
             cset(ctrl, "mButtonFrameLeftClick", frame)
+            agent_was_firing = true
+        elseif not do_fire then
+            agent_was_firing = false
         end
     end
+
+    if cdata then
+        log_action_trace({
+            f  = GameGetFrameNum(), a  = action,
+            mx = move_x, jp = do_jump and 1 or 0,
+            fr = do_fire and 1 or 0, at = aim_type,
+            vx = vx_out, vy = vy_out, gnd = on_ground_now and 1 or 0,
+        })
+    end
+end
 
     -- Trace one record per applied action for offline analysis
     if cdata then
@@ -430,8 +455,9 @@ local function dist_char(d)
     else return " " end
 end
 
-local function draw_radar(g, ox, oy, rays)
+local function draw_radar(g, ox, oy, rays, saliency)
     local cell = 8
+    local s_threshold = 0.05
     for row = 1, 3 do
         for col = 1, 3 do
             local idx = GRID[row][col]
@@ -442,12 +468,43 @@ local function draw_radar(g, ox, oy, rays)
                 GuiText(g, tx, ty, "@")
             else
                 local d = rays[idx] or 1.0
-                GuiColorSetForNextWidget(g, 1-d, d, 0, 1)
+                local s = saliency and saliency[idx] or 0.0
+                
+                if s > s_threshold then
+                    -- Highly salient: white border/highlight
+                    GuiColorSetForNextWidget(g, 1, 1, 1, 1)
+                else
+                    GuiColorSetForNextWidget(g, 1-d, d, 0, 1)
+                end
                 GuiText(g, tx, ty, dist_char(d))
             end
         end
     end
     GuiColorSetForNextWidget(g, 1, 1, 1, 1)
+end
+
+local function draw_probs(g, ox, oy, probs)
+    local bar_max_w = 40
+    for i = 0, 9 do
+        local p = probs[i+1] or 0.0
+        local name = ACTION_NAMES[i] or "?"
+        local ty = oy + i * 10
+        
+        -- Draw bar background
+        GuiColorSetForNextWidget(g, 0.2, 0.2, 0.2, 1)
+        GuiText(g, ox + 35, ty, "....................")
+        
+        -- Draw bar
+        local bar_len = math.floor(p * 20)
+        if bar_len > 0 then
+            GuiColorSetForNextWidget(g, 0.4, 0.8, 1, 1)
+            GuiText(g, ox + 35, ty, string.rep("|", bar_len))
+        end
+        
+        -- Draw text
+        GuiColorSetForNextWidget(g, 0.8, 0.8, 0.8, 1)
+        GuiText(g, ox, ty, string.format("%-5s %3d%%", name, math.floor(p*100)))
+    end
 end
 
 -- ── 8-direction liquid sensors ────────────────────────────────────────────
@@ -621,28 +678,28 @@ local function get_jetpack_fuel(player)
 end
 
 -- ── Wand ready (1=can fire, 0=on cooldown) ───────────────────────────────
--- The player has many children (perks, inventory items, the wand). We want the
--- WAND specifically — wand entities have tag "wand" or "card_action". Reading
--- AbilityComponent from the first child (e.g. a perk) gives garbage cooldowns.
 local function get_wand_ready(player)
-    local frame    = GameGetFrameNum()
-    local children = EntityGetAllChildren(player) or {}
-    local wand_ab  = nil
-    for _, child in ipairs(children) do
-        local is_wand = pcall(EntityHasTag, child, "wand") and EntityHasTag(child, "wand")
-        if is_wand then
-            wand_ab = EntityGetFirstComponent(child, "AbilityComponent")
-            if wand_ab then break end
-        end
-    end
-    if not wand_ab then
-        -- Fall back: any AbilityComponent on any child (old behaviour).
+    local frame = GameGetFrameNum()
+    local inv2  = EntityGetFirstComponent(player, "Inventory2Component")
+    if not inv2 then return 1.0 end
+    
+    local active_wand = cget(inv2, "mActiveItem")
+    if not active_wand or active_wand == 0 then
+        -- Try searching children if Inventory2 fails (unlikely for player_unit)
+        local children = EntityGetAllChildren(player) or {}
         for _, child in ipairs(children) do
-            local ab = EntityGetFirstComponent(child, "AbilityComponent")
-            if ab then wand_ab = ab; break end
+            if EntityHasTag(child, "wand") then
+                active_wand = child
+                break
+            end
         end
     end
+
+    if not active_wand or active_wand == 0 then return 1.0 end
+    
+    local wand_ab = EntityGetFirstComponent(active_wand, "AbilityComponent")
     if not wand_ab then return 1.0 end
+    
     local next_use = cget(wand_ab, "mNextFrameUsable") or 0
     return (frame >= next_use) and 1.0 or 0.0
 end
@@ -760,17 +817,24 @@ function OnWorldPostUpdate()
 
     -- Buffer incoming action ───────────────────────────────────────────────
     if msg and type(msg) == "string" and #msg > 0 then
-        local ok2, act = pcall(json.decode, msg)
-        if ok2 and type(act) == "number" then
+        local ok2, data = pcall(json.decode, msg)
+        if ok2 and type(data) == "table" then
+            local act = data.action
             if act == -1 then
-                -- Python truncated the episode (no-descent penalty).
-                -- Setting virtual_hp=0 triggers the normal death-detection block
-                -- at the end of this frame: it will send dead_state, call
-                -- respawn_player(), and start a fresh episode automatically.
                 info("Force-respawn requested by Python (cowardice truncation)")
                 virtual_hp = 0.0
-            else
+            elseif act then
                 pending_action = math.floor(act)
+            end
+            hud_probs = data.probs or {}
+            hud_saliency = data.saliency or {}
+        elseif ok2 and type(data) == "number" then
+            -- Backwards compatibility for raw action number
+            if data == -1 then
+                info("Force-respawn requested by Python (truncation)")
+                virtual_hp = 0.0
+            else
+                pending_action = math.floor(data)
             end
         else
             warn("Bad action payload: " .. msg:sub(1, 40))
@@ -897,8 +961,15 @@ function OnWorldPostUpdate()
 
     -- Draw radar ───────────────────────────────────────────────────────────
     GuiIdPushString(gui, "rl_radar")
-    draw_radar(gui, 10, 24, rays)
+    draw_radar(gui, 10, 24, rays, hud_saliency)
     GuiIdPop(gui)
+
+    -- Draw probabilities ──────────────────────────────────────────────────
+    if #hud_probs > 0 then
+        GuiIdPushString(gui, "rl_probs")
+        draw_probs(gui, 10, 55, hud_probs)
+        GuiIdPop(gui)
+    end
 
     episode_steps = episode_steps + 1
 

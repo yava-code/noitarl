@@ -24,6 +24,55 @@ from notify import TelegramNotifier
 
 console = Console()
 
+import torch
+
+class ThinkingCallback(BaseCallback):
+    """
+    Calculates action probabilities and saliency maps for the live HUD.
+    Runs during rollouts to update Noita with what the agent is "thinking".
+    """
+    def __init__(self, verbose: int = 0):
+        super().__init__(verbose)
+
+    def _on_step(self) -> bool:
+        # Get the underlying environment (unwrapped NoitaEnv)
+        # Assumes DummyVecEnv or SubprocVecEnv wrapping a single NoitaEnv
+        try:
+            # self.training_env can be a VecEnv
+            # We try to find the NoitaEnv and set_extra on it.
+            # Only support the first env in the vector for now.
+            if hasattr(self.training_env, "envs"):
+                env = self.training_env.envs[0].unwrapped
+                if hasattr(env, "set_extra"):
+                    obs = self.locals.get("new_obs")
+                    if obs is not None:
+                        # new_obs is a batch, we take the first env
+                        probs, saliency = self._calculate_thinking(obs[0])
+                        env.set_extra({"probs": probs, "saliency": saliency})
+        except Exception as exc:
+            # Don't crash training if visualization fails
+            if self.verbose > 1:
+                logger.debug("ThinkingCallback failed: {}", exc)
+        return True
+
+    def _calculate_thinking(self, obs):
+        model = self.model
+        obs_tensor = torch.as_tensor(obs).unsqueeze(0).to(model.device).requires_grad_(True)
+        
+        with torch.set_grad_enabled(True):
+            # Get distribution and probabilities
+            distribution = model.policy.get_distribution(obs_tensor)
+            probs = distribution.distribution.probs[0].detach().cpu().numpy().tolist()
+            
+            # Calculate saliency (gradient of the selected action's logit w.r.t. observation)
+            logits = distribution.distribution.logits
+            action_idx = logits.argmax()
+            logits[0, action_idx].backward()
+            
+            saliency = obs_tensor.grad.abs().squeeze().cpu().numpy().tolist()
+        
+        return probs, saliency
+
 # optional wandb
 try:
     import wandb
@@ -361,18 +410,32 @@ class NoitaMonitorCallback(BaseCallback):
         
         current_ep_length = self.num_timesteps - self._current_ep_start_step
         
+        # Additional metrics from history
+        best_run_str = "–"
+        recent_kills = 0
+        if os.path.exists(self._csv_path):
+            try:
+                import pandas as pd
+                df = pd.read_csv(self._csv_path)
+                if not df.empty:
+                    max_d = df['max_spawn_distance'].max()
+                    max_depth = df['max_depth'].max()
+                    best_run_str = f"{max_d:.0f}px (depth {max_depth:.0f}px)"
+                    recent_kills = df['kills'].tail(10).sum()
+            except Exception:
+                pass
+
         return (
             f"Steps: {self.num_timesteps:,} / {self._cfg.total_timesteps:,} ({pct:.1f}%)\n"
             f"Episodes: {self._total_episodes:,}\n"
             f"Current Ep Steps: {current_ep_length:,}\n"
             f"Mean reward: {mean_r:.2f}\n"
-            f"Mean ep length: {mean_l:.0f}\n"
-            f"Mean spawn distance: {mean_d:.0f}\n"
-            f"Best distance: {self._best_spawn_distance:.0f}\n"
-            f"Session Kills: {self._session_kills:,}\n"
+            f"Mean length: {mean_l:.0f} | Chunks: {mean_c:.1f}\n"
+            f"Mean distance: {mean_d:.0f}px\n"
+            f"Best Run: {best_run_str}\n"
+            f"Kills: session {self._session_kills:,} / last 10 {recent_kills}\n"
             f"Deaths/Timeouts: {self._session_deaths} / {self._session_timeouts}\n"
-            f"Speed: {sps:.0f} steps/s\n"
-            f"Elapsed: {elapsed/3600:.1f} h"
+            f"Speed: {sps:.0f} steps/s | Uptime: {elapsed/3600:.1f}h"
         )
 
     def _send_tg_update(self) -> None:
@@ -412,8 +475,15 @@ class NoitaMonitorCallback(BaseCallback):
         if self._recorder is None:
             self._tg.send_text("⚠️ VideoRecorder is not running.")
             return
-        if not self._recorder.is_idle:
-            self._tg.send_text("⏳ Recorder is busy — try again in ~20 seconds.")
+        st = self._recorder.status
+        if st == "recording":
+            self._tg.send_text("🎬 Already recording! GIF will arrive in ~10 seconds automatically.")
+            return
+        if st == "post":
+            self._tg.send_text("🎞 Collecting post-footage — GIF arrives in ~5 seconds.")
+            return
+        if st == "cooldown":
+            self._tg.send_text("⏳ On cooldown after last GIF. Try again in ~15 seconds.")
             return
         ctx = {
             "episode": self._total_episodes,

@@ -25,6 +25,25 @@ from config import Config
 console = Console()
 
 
+import torch
+
+def calculate_thinking(model, obs):
+    """Calculate action probabilities and saliency map for the current observation."""
+    obs_tensor = torch.as_tensor(obs).unsqueeze(0).to(model.device).requires_grad_(True)
+    
+    # Get distribution and probabilities
+    distribution = model.policy.get_distribution(obs_tensor)
+    probs = distribution.distribution.probs[0].detach().cpu().numpy().tolist()
+    
+    # Calculate saliency (gradient of the selected action's logit w.r.t. observation)
+    logits = distribution.distribution.logits
+    action_idx = logits.argmax()
+    logits[0, action_idx].backward()
+    
+    saliency = obs_tensor.grad.abs().squeeze().cpu().numpy().tolist()
+    
+    return probs, saliency
+
 def evaluate(model_path: str, n_episodes: int, port: int, step_delay: float) -> None:
     cfg = Config()
 
@@ -57,6 +76,10 @@ def evaluate(model_path: str, n_episodes: int, port: int, step_delay: float) -> 
         steps   = 0
 
         while not done:
+            # Calculate "Thinking" data
+            probs, saliency = calculate_thinking(model, obs)
+            env.set_extra({"probs": probs, "saliency": saliency})
+
             action, _ = model.predict(obs, deterministic=True)
             obs, r, done, _, _ = env.step(int(action))
             total_r += r

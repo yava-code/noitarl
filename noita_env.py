@@ -20,10 +20,12 @@ Observation (60 float32, all in [0, 1]):
   [58]       portal dx_norm    (0.5=portal at same X; <0.5 left, >0.5 right)
   [59]       portal dy_norm    (0.5=portal at same Y; <0.5 above, >0.5 below)
 
-Actions (Discrete 10):
-  0=idle  1=left  2=right  3=jump
-  4=left+jump  5=right+jump  6=fire(auto-aim)  7=fire-down(dig)
-  8=kick(melee)  9=jetpack_hold(ascend, burns fuel)
+Actions (Discrete 18):
+  0=idle  1=left  2=right  3=jump  4=left+jump  5=right+jump
+  6=jetpack_hold(ascend)  7=kick(melee)
+  8=fire_R  9=fire_UR  10=fire_U  11=fire_UL
+  12=fire_L  13=fire_DL  14=fire_D  15=fire_DR
+  16=fire_auto_enemy  17=fire_smart_loot
 """
 
 from __future__ import annotations
@@ -63,7 +65,7 @@ class NoitaEnv(gym.Env):
         self.host = host
         self.port = port
 
-        self.action_space = gym.spaces.Discrete(10)
+        self.action_space = gym.spaces.Discrete(18)
         self.observation_space = gym.spaces.Box(
             low=0.0, high=1.0, shape=(60,), dtype=np.float32
         )
@@ -101,6 +103,7 @@ class NoitaEnv(gym.Env):
         self._fast_mv_counter = 0        # consecutive steps with |vx|>120
         self._long_survival_triggered = False   # fires once per episode at step 600
         self._recorder = None            # injected via set_recorder()
+        self._extra_to_send: Optional[dict] = None
 
         self._start_server()
         logger.info("[env:{}] WebSocket server on {}:{}", self.port, host, port)
@@ -108,6 +111,10 @@ class NoitaEnv(gym.Env):
     def set_recorder(self, recorder) -> None:
         """Inject VideoRecorder after construction (avoids circular import)."""
         self._recorder = recorder
+
+    def set_extra(self, extra: dict) -> None:
+        """Set extra data (probs, saliency) to be sent with the next action."""
+        self._extra_to_send = extra
 
     # ── WebSocket server ──────────────────────────────────────────────────────
 
@@ -163,15 +170,19 @@ class NoitaEnv(gym.Env):
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
-    def _send_action(self, action: int) -> None:
+    def _send_action(self, action: int, extra: Optional[dict] = None) -> None:
         with self._lock:
             ws   = self._ws
             loop = self._loop
         if ws is None or loop is None:
             return
         try:
+            payload = {"action": int(action)}
+            if extra:
+                payload.update(extra)
+            
             asyncio.run_coroutine_threadsafe(
-                ws.send(json.dumps(action)), loop
+                ws.send(json.dumps(payload)), loop
             ).result(timeout=0.2)
         except Exception as exc:
             logger.debug("[env:{}] send_action failed: {}", self.port, exc)
@@ -284,7 +295,8 @@ class NoitaEnv(gym.Env):
         prev_state = self._get_state()
         prev_frame = prev_state.get("frame", -1) if prev_state else -1
 
-        self._send_action(int(action))
+        self._send_action(int(action), extra=self._extra_to_send)
+        self._extra_to_send = None
 
         # Wait for a genuinely new game frame, not stale data
         state = self._wait_for_new_frame(prev_frame)
