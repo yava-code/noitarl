@@ -162,7 +162,7 @@ local ACTION_DECODE = {
     [8]={ 0, false, false, false, true,  false },
     [9]={ 0, false, false, false, false, true  },
 }
-local MAX_EP_STEPS    = 1500  -- ~1.7 min at 60 fps with FRAME_SKIP=4; agent must descend
+local MAX_EP_STEPS    = 2000  -- ~2.2 min at 60 fps with FRAME_SKIP=4
 
 -- ── Episode tracking ──────────────────────────────────────────────────────
 -- spawn_candidates accumulates good "anchor" positions; respawn picks one at random
@@ -173,15 +173,6 @@ local episode_num           = 0
 local episode_steps         = 0
 local frame_times           = {}   -- rolling window for FPS estimate
 
--- ── Static-position stuck detector ───────────────────────────────────────
--- If the agent's world position hasn't moved more than STATIC_THRESHOLD px
--- in STATIC_CHECK_FRAMES consecutive frames → force respawn.
--- Catches Lua-side freezes that the Python 300-step truncation can't see.
-local STATIC_CHECK_FRAMES   = 200
-local STATIC_THRESHOLD      = 5.0
-local static_last_x         = nil
-local static_last_y         = nil
-local static_frames_elapsed = 0
 local PERF_WINDOW           = 60
 
 -- Action trace log (one line per applied action) for offline debugging
@@ -409,11 +400,6 @@ local function respawn_player(player)
     pcall(EntityRemoveIngestionStatusEffect, player, "RADIOACTIVE")
     local water_id = CellFactory_GetType("water")
     pcall(EntityAddRandomStains, player, water_id, 400)
-
-    -- Reset static-stuck detector so a new episode starts fresh
-    static_last_x         = nil
-    static_last_y         = nil
-    static_frames_elapsed = 0
 
     episode_num       = episode_num + 1
     episode_steps     = 0
@@ -799,15 +785,23 @@ function OnWorldPostUpdate()
 
     if not spawn_x then
         -- First frame: drop the player from the surface into the Mines.
-        -- The surface biome is open terrain with no corridors — the agent
-        -- wanders aimlessly there. We raycast straight down to find the
-        -- first platform and teleport just above it.
-        local target_x, target_y = x, y + 400  -- fallback if raycast misses
+        -- We skip the first SKIP_SURFACE_PX of terrain so we don't land on
+        -- the surface ledge — we want to be in the actual underground mines.
+        local SKIP_SURFACE_PX = 450  -- ignore surface terrain in first 450 px
+        local target_x, target_y = x, y + 700  -- fallback: guaranteed underground
+
+        -- Primary: find first platform below the surface layer.
         local rok, hit, _hx, hy = pcall(
-            RaytracePlatforms, x, y + 10, x, y + INITIAL_DESCENT_RANGE
+            RaytracePlatforms, x, y + SKIP_SURFACE_PX, x, y + INITIAL_DESCENT_RANGE
         )
         if rok and hit then
             target_y = hy - INITIAL_DESCENT_LIFT
+        end
+
+        -- Safety: if we ended up suspiciously close to the starting y,
+        -- the raycast hit surface terrain — push further down.
+        if math.abs(target_y - y) < 300 then
+            target_y = y + 700
         end
 
         pcall(EntitySetTransform, player, target_x, target_y)
@@ -891,26 +885,6 @@ function OnWorldPostUpdate()
     GuiIdPop(gui)
 
     episode_steps = episode_steps + 1
-
-    -- ── Static-position stuck detector ───────────────────────────────────
-    -- Only runs on action frames (frame % FRAME_SKIP == 0, already guaranteed
-    -- above), so STATIC_CHECK_FRAMES corresponds to FRAME_SKIP × N real frames.
-    static_frames_elapsed = static_frames_elapsed + 1
-    if static_frames_elapsed >= STATIC_CHECK_FRAMES then
-        if static_last_x ~= nil then
-            local dx = math.abs(x - static_last_x)
-            local dy = math.abs(y - static_last_y)
-            if dx < STATIC_THRESHOLD and dy < STATIC_THRESHOLD then
-                warn(string.format(
-                    "Stuck detected: pos unchanged (%.1fpx) over %d steps — forcing respawn",
-                    math.sqrt(dx*dx + dy*dy), STATIC_CHECK_FRAMES))
-                virtual_hp = 0.0  -- triggers death detection at end of frame
-            end
-        end
-        static_last_x         = x
-        static_last_y         = y
-        static_frames_elapsed = 0
-    end
 
     -- Periodic diagnostic log ──────────────────────────────────────────────
     if (frame % 300) == 0 then

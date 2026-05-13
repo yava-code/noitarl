@@ -321,34 +321,25 @@ class NoitaEnv(gym.Env):
                 )
 
         # ── Reward ────────────────────────────────────────────────────────────
-        # Design goal: ONLY vertical descent gives positive reward.
-        # Horizontal wandering without descent is penalised so the agent cannot
-        # exploit the Manhattan-distance reward by pacing left/right.
         reward = -0.001  # small time tax
 
-        # Track max_spawn_distance for logging/callbacks (no reward signal).
+        # 1. Manhattan progress: rewards any movement that expands the frontier,
+        #    giving the agent a dense signal while it learns the topology.
         dist = abs(current_x - self.spawn_x) + abs(current_y - self.spawn_y)
         if dist > self.max_spawn_distance:
+            reward += (dist - self.max_spawn_distance) * 0.015
             self.max_spawn_distance = dist
 
-        # 1. Vertical depth is the ONLY positive progress signal.
-        #    current_y increases as the agent goes deeper (Noita: +Y = down).
+        # 2. Depth — weighted 2× higher than Manhattan so the agent prefers
+        #    going DOWN over going sideways at the same speed.
         if current_y > self.max_depth_y:
-            reward += (current_y - self.max_depth_y) * 0.025
+            reward += (current_y - self.max_depth_y) * 0.03
             self.max_depth_y = current_y
             self.steps_without_descent = 0
         else:
             self.steps_without_descent += 1
-            # Horizontal penalty: lateral movement without descent is penalised.
-            # Proportional to |vx| so small drift is forgiven but sustained
-            # left/right pacing gets a clear negative signal.
-            vx_raw = abs(state.get("vx", 0.0))
-            if vx_raw > 20.0:
-                reward -= 0.003
 
-        # 2. Chunk curiosity — only underground (sky-farm guard) and only when
-        #    the chunk is strictly deeper than the episode start to keep it
-        #    aligned with the vertical objective.
+        # 3. Chunk curiosity — underground only (sky-farm guard).
         chunk = (int(current_x // 32), int(current_y // 32))
         if chunk not in self.visited_chunks:
             self.visited_chunks.add(chunk)
@@ -356,16 +347,16 @@ class NoitaEnv(gym.Env):
             if sky_vis < 0.3:
                 reward += 0.5
 
-        # 3. Strict truncation: 300 steps (~20 s) without new depth record.
-        #    The -5.0 "cowardice" penalty creates a strong signal that idling
-        #    or lateral wandering is always worse than attempting descent.
+        # 4. Truncation: no depth progress for 500 steps (~33 s).
+        #    Mild penalty so the agent prefers any movement over total stagnation,
+        #    but not so harsh that it makes IDLE the safest policy.
         truncated = False
-        if self.steps_without_descent > 300:
-            reward -= 5.0
+        if self.steps_without_descent > 500:
+            reward -= 2.0
             truncated = True
-            self._send_action(-1)   # signal Lua: force-respawn immediately
+            self._send_action(-1)   # tell Lua to respawn immediately
             logger.info(
-                "[env:{}] Truncated — no descent for 300 steps. Cowardice penalty -5.",
+                "[env:{}] Truncated — no descent for 500 steps (-2 penalty).",
                 self.port,
             )
 
