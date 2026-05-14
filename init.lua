@@ -369,18 +369,6 @@ local function apply_action(player, action)
     end
 end
 
-    -- Trace one record per applied action for offline analysis
-    if cdata then
-        log_action_trace({
-            f  = GameGetFrameNum(),
-            a  = action,
-            mx = move_x, jp = do_jump and 1 or 0,
-            fr = do_fire and 1 or 0, ad = aim_down and 1 or 0,
-            vx = vx_out, vy = vy_out, gnd = on_ground_now and 1 or 0,
-        })
-    end
-end
-
 -- ── Respawn: teleport to (possibly randomised) spawn, reset state ────────
 local function pick_spawn()
     -- Choose one of the recorded anchor positions and jitter it slightly so

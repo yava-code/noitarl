@@ -212,6 +212,121 @@ class TelegramNotifier:
             logger.error(f"Failed to create death postcard: {e}")
             return png_bytes
 
+    @staticmethod
+    def make_rich_collage(
+        rewards: list[float],
+        route_x: list[float],
+        route_y: list[float],
+        actions: list[int],
+        reward_breakdown: dict,
+        title: str = "NoitaRL Performance Overview"
+    ) -> bytes:
+        """Create a 2x2 collage of charts for a deep dive into the agent's brains."""
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        fig.suptitle(title, fontsize=16, fontweight='bold')
+        
+        # 1. Reward Curve (Top Left)
+        ax1 = axes[0, 0]
+        ax1.plot(rewards, color='blue', alpha=0.3)
+        if len(rewards) > 10:
+            import pandas as pd
+            sma = pd.Series(rewards).rolling(10).mean()
+            ax1.plot(sma, color='red', linewidth=2, label='SMA 10')
+        ax1.set_title("Episode Rewards")
+        ax1.set_xlabel("Episode")
+        ax1.set_ylabel("Reward")
+        ax1.grid(True, alpha=0.3)
+        
+        # 2. GPS Track (Top Right)
+        ax2 = axes[0, 1]
+        if route_x and route_y:
+            ax2.plot(route_x, route_y, color='green', alpha=0.7)
+            ax2.scatter(route_x[0], route_y[0], color='blue', s=50, label='Start', zorder=5)
+            ax2.scatter(route_x[-1], route_y[-1], color='red', s=50, label='End', zorder=5)
+            ax2.invert_yaxis() # Noita's Y is positive downwards
+            ax2.set_title("Best Run GPS Track")
+            ax2.legend()
+        else:
+            ax2.text(0.5, 0.5, "No route data", ha='center', va='center')
+        ax2.set_aspect('equal', 'datalim')
+        
+        # 3. Action Distribution (Bottom Left)
+        ax3 = axes[1, 0]
+        if actions:
+            from collections import Counter
+            # Map action IDs to names
+            ACTION_NAMES = {
+                0:"IDLE", 1:"L", 2:"R", 3:"UP", 4:"UL", 5:"UR",
+                6:"JETPK", 7:"KICK",
+                8:"F_R", 9:"F_UR", 10:"F_U", 11:"F_UL",
+                12:"F_L", 13:"F_DL", 14:"F_D", 15:"F_DR",
+                16:"F_AUTO", 17:"F_SMART"
+            }
+            counts = Counter(actions)
+            labels = [ACTION_NAMES.get(a, str(a)) for a in counts.keys()]
+            ax3.pie(counts.values(), labels=labels, autopct='%1.1f%%', startangle=140)
+            ax3.set_title("Action Distribution (Last Ep)")
+        else:
+            ax3.text(0.5, 0.5, "No action data", ha='center', va='center')
+            
+        # 4. Reward Breakdown (Bottom Right)
+        ax4 = axes[1, 1]
+        if reward_breakdown:
+            # Filter zero/tiny values for clarity
+            filtered = {k: v for k, v in reward_breakdown.items() if abs(v) > 0.01}
+            keys = list(filtered.keys())
+            vals = list(filtered.values())
+            colors = ['green' if v > 0 else 'red' for v in vals]
+            ax4.barh(keys, vals, color=colors)
+            ax4.set_title("Reward Breakdown (Last Ep)")
+            ax4.axvline(0, color='black', linewidth=0.8)
+        else:
+            ax4.text(0.5, 0.5, "No breakdown data", ha='center', va='center')
+            
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', dpi=100)
+        plt.close(fig)
+        return buf.getvalue()
+
+    def generate_ai_status(self, groq_key: str, stats_context: str) -> str:
+        """Call Groq to generate a smart, analytical summary of the training status."""
+        if not groq_key:
+            return "⚠️ Groq API key not set. Please set GROQ_API_KEY in .env."
+            
+        try:
+            from groq import Groq
+            client = Groq(api_key=groq_key)
+            
+            prompt = (
+                "You are an expert AI Analyst for a Reinforcement Learning project 'NoitaRL'.\n"
+                "A PPO agent is learning to play Noita, a physics-based roguelite.\n"
+                "You are provided with a 'mini-MCP' data dump including recent metrics, logs, "
+                "reward breakdowns, and action histories.\n\n"
+                "== PROJECT CONTEXT ==\n"
+                "- Goal: Reach maximum depth and explore maximum spawn distance (Mines).\n"
+                "- Rewards: Manhattan distance, depth, chunk discovery, kills, chests.\n"
+                "- Penalties: Damage, death, timeout (no descent), action loops.\n\n"
+                f"== CURRENT STATUS DATA ==\n{stats_context}\n\n"
+                "Write a HIGHLY ANALYTICAL and CONCISE (2-3 paragraphs) summary for the user in Telegram.\n"
+                "1. Identify the agent's current 'behavioral mode' (e.g., 'aggressive explorer', 'cautious looter', 'stuck in local minima').\n"
+                "2. Highlight specific metrics that show progress or regression (reference numbers).\n"
+                "3. Suggest what the agent might be 'thinking' or struggling with (e.g., 'it avoids projectiles well but fails to commit to depth').\n"
+                "Use bold text for key terms. Use technical but readable tone. NO filler or introductions."
+            )
+            
+            completion = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.6,
+                max_completion_tokens=400,
+            )
+            return completion.choices[0].message.content.strip()
+        except Exception as e:
+            logger.error("Groq AI status failed: {}", e)
+            return f"⚠️ AI Analysis failed: {str(e)}"
+
     # ── Command bot ───────────────────────────────────────────────────────────
 
     def register_command(self, command: str, handler: Callable, description: str = "") -> None:

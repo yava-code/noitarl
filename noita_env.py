@@ -561,6 +561,13 @@ class NoitaEnv(gym.Env):
                 "noita/route_y":                self.route_y,
                 "noita/visually_stuck":         visually_stuck,
                 "noita/action_loop":            action_loop,
+                "noita/reward_breakdown": {
+                    "time": r_time, "manh": r_manh, "depth": r_depth,
+                    "chunk": r_chunk, "fire": r_fire, "portal": r_portal,
+                    "kills": r_kills, "dmg": r_dmg, "death": r_death,
+                    "trunc": r_trunc,
+                },
+                "noita/action_history": self.action_history,
             }
             with self._lock:
                 self._state = None   # force reset() to wait for fresh state

@@ -119,6 +119,12 @@ class NoitaMonitorCallback(BaseCallback):
         self._session_timeouts = 0
         self._session_kills = 0
         self._current_ep_start_step = 0
+        
+        # Tracking for rich plots and AI status
+        self._best_route_x = []
+        self._best_route_y = []
+        self._last_reward_breakdown = {}
+        self._last_action_history = []
 
         os.makedirs("data", exist_ok=True)
         os.makedirs("data/hall_of_fame", exist_ok=True)
@@ -205,6 +211,10 @@ class NoitaMonitorCallback(BaseCallback):
             route_y = info.get("noita/route_y", [])
             visually_stuck = info.get("noita/visually_stuck", False)
             action_loop = info.get("noita/action_loop", False)
+            
+            # Store last detailed breakdown for rich plots/analysis
+            self._last_reward_breakdown = info.get("noita/reward_breakdown", {})
+            self._last_action_history = info.get("noita/action_history", [])
 
             self._ep_rewards.append(r)
             self._ep_lengths.append(l)
@@ -238,6 +248,8 @@ class NoitaMonitorCallback(BaseCallback):
 
             if dist > self._best_spawn_distance:
                 self._best_spawn_distance = dist
+                self._best_route_x = route_x
+                self._best_route_y = route_y
                 self._on_new_record(dist, depth, kills, route_x, route_y, postcard)
                 # Trigger VideoRecorder clip for new record (main process, good quality)
                 if self._recorder is not None:
@@ -395,9 +407,8 @@ class NoitaMonitorCallback(BaseCallback):
         else:
             self._tg.send_text(caption)
             
-        if rx and ry:
-            route_png = TelegramNotifier.make_route_plot(rx, ry, title=f"Record Route: {dist:.0f}px")
-            self._tg.send_photo(route_png, caption="GPS Track")
+        # GPS Track disabled automatically on record per user request. 
+        # Only sent manually via /plot now.
 
     def _stats_text(self) -> str:
         elapsed = time.time() - self._start_ts
@@ -528,6 +539,59 @@ class NoitaMonitorCallback(BaseCallback):
         )
         self._tg.send_text(msg)
 
+    def _cmd_status(self) -> None:
+        """AI-powered analytical status report (mini-MCP)."""
+        try:
+            # 1. Gather raw stats
+            stats = self._stats_text()
+            
+            # 2. Gather last reward breakdown
+            rb = self._last_reward_breakdown
+            rb_str = "\n".join([f"  {k}: {v:+.3f}" for k, v in rb.items()]) if rb else "No data"
+            
+            # 3. Gather action history
+            ah = self._last_action_history[-100:] if self._last_action_history else []
+            from collections import Counter
+            counts = Counter(ah)
+            ah_str = ", ".join([f"Act {k}: {v}%" for k, v in counts.items()])
+            
+            # 4. Gather recent logs (last 10 lines)
+            log_str = ""
+            log_files = glob.glob(os.path.join(self._cfg.log_dir, "*.log"))
+            if log_files:
+                latest_log = max(log_files, key=os.path.getmtime)
+                with open(latest_log, "r", encoding="utf-8") as f:
+                    # Read last 4KB
+                    f.seek(0, os.SEEK_END)
+                    f.seek(max(f.tell() - 4000, 0), os.SEEK_SET)
+                    log_str = "".join(f.readlines()[-10:])
+
+            # 5. PPO Metrics (from model logger)
+            ppo_str = ""
+            if hasattr(self.model, "logger"):
+                # accessing private _stats for rich info
+                log_data = getattr(self.model.logger, "name_to_value", {})
+                ppo_str = "\n".join([f"  {k}: {v}" for k, v in log_data.items() if "train/" in k])
+
+            context = (
+                f"GENERAL STATS:\n{stats}\n\n"
+                f"LAST REWARD BREAKDOWN:\n{rb_str}\n\n"
+                f"LAST ACTION DIST (100 steps):\n{ah_str}\n\n"
+                f"PPO TRAINING METRICS:\n{ppo_str}\n\n"
+                f"RECENT LOGS:\n{log_str}"
+            )
+
+            # Send 'thinking' message
+            self._tg.send_text("🧠 <b>AI Analyst is crunching the data...</b>")
+            
+            # Call LLM
+            analysis = self._tg.generate_ai_status(self._cfg.groq_api_key, context)
+            self._tg.send_text(f"📊 <b>Training Analysis</b>\n\n{analysis}")
+            
+        except Exception as e:
+            logger.error("AI Status command failed: {}", e)
+            self._tg.send_text(f"⚠️ Analysis failed: {e}")
+
     def _cmd_stop(self) -> None:
         logger.warning("Stop command received via Telegram")
         self._stop_requested = True
@@ -537,11 +601,23 @@ class NoitaMonitorCallback(BaseCallback):
         if not self._ep_rewards:
             self._tg.send_text("No episode data yet.")
             return
-        png = TelegramNotifier.make_reward_plot(
-            list(self._ep_rewards),
-            title=f"NoitaRL — {self.num_timesteps:,} steps",
-        )
-        self._tg.send_photo(png, caption=f"Episodes: {self._total_episodes}")
+            
+        # Send 'thinking' message
+        self._tg.send_text("🎨 <b>Generating rich performance collage...</b>")
+            
+        try:
+            png = TelegramNotifier.make_rich_collage(
+                list(self._ep_rewards),
+                self._best_route_x,
+                self._best_route_y,
+                self._last_action_history,
+                self._last_reward_breakdown,
+                title=f"NoitaRL — Step {self.num_timesteps:,}"
+            )
+            self._tg.send_photo(png, caption=f"Overall Performance Overview (Ep {self._total_episodes})")
+        except Exception as e:
+            logger.error("Plot collage failed: {}", e)
+            self._tg.send_text(f"⚠️ Failed to generate collage: {e}")
 
     def _cmd_best(self) -> None:
         files = glob.glob("data/hall_of_fame/run_*.png")
