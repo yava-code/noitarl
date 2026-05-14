@@ -123,7 +123,7 @@ class NoitaMonitorCallback(BaseCallback):
         # Tracking for rich plots and AI status
         self._best_route_x = []
         self._best_route_y = []
-        self._last_reward_breakdown = {}
+        self._last_reward_breakdown = {}   # per-episode totals (accumulated in noita_env.py)
         self._last_action_history = []
 
         os.makedirs("data", exist_ok=True)
@@ -154,6 +154,7 @@ class NoitaMonitorCallback(BaseCallback):
         notifier.register_command("logs",   self._cmd_logs,   "Tail the latest run logs")
         notifier.register_command("record", self._cmd_record, "Record ~15s clip of current gameplay")
         notifier.register_command("debug",  self._cmd_debug,  "Show current reward breakdown & recent episode stats")
+        notifier.register_command("status", self._cmd_status, "AI-powered training analysis (Groq LLM)")
         notifier.register_command("help",   self._cmd_help,   "Show help message")
 
     # ── SB3 lifecycle ─────────────────────────────────────────────────────────
@@ -212,7 +213,7 @@ class NoitaMonitorCallback(BaseCallback):
             visually_stuck = info.get("noita/visually_stuck", False)
             action_loop = info.get("noita/action_loop", False)
             
-            # Store last detailed breakdown for rich plots/analysis
+            # noita/reward_breakdown is the cumulative episode total (accumulated in noita_env.py)
             self._last_reward_breakdown = info.get("noita/reward_breakdown", {})
             self._last_action_history = info.get("noita/action_history", [])
 
@@ -508,8 +509,8 @@ class NoitaMonitorCallback(BaseCallback):
         self._recorder.force_trigger("manual_record", ctx)
         self._tg.send_text(
             "🎥 <b>Recording started!</b>\n"
-            "Capturing 5s pre-roll + 5s live + 5s post.\n"
-            "Clip will arrive in ~15 seconds."
+            "Capturing 3s pre-roll + 4s live + 3s post.\n"
+            "Clip will arrive in ~10 seconds."
         )
 
     def _cmd_debug(self) -> None:
@@ -550,10 +551,15 @@ class NoitaMonitorCallback(BaseCallback):
             rb_str = "\n".join([f"  {k}: {v:+.3f}" for k, v in rb.items()]) if rb else "No data"
             
             # 3. Gather action history
+            _ACTION_NAMES = {0:"IDLE",1:"LEFT",2:"RIGHT",3:"JUMP",4:"L+JMP",
+                             5:"R+JMP",6:"FIRE",7:"DIG↓",8:"KICK",9:"JETPACK"}
             ah = self._last_action_history[-100:] if self._last_action_history else []
             from collections import Counter
             counts = Counter(ah)
-            ah_str = ", ".join([f"Act {k}: {v}%" for k, v in counts.items()])
+            total_ah = len(ah) or 1
+            ah_str = ", ".join(
+                [f"{_ACTION_NAMES.get(k, k)}: {v * 100 // total_ah}%" for k, v in counts.most_common()]
+            )
             
             # 4. Gather recent logs (last 10 lines)
             log_str = ""

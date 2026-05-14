@@ -94,10 +94,15 @@ class NoitaEnv(gym.Env):
         self.episode_start_time   = time.time()
         self.steps_without_descent = 0   # resets only on new depth record
         self.visited_chunks: set  = set()
-        
+
         self.route_x: list[float] = []
         self.route_y: list[float] = []
         self.action_history: list[int] = []
+        self._ep_breakdown: dict = {}    # cumulative reward breakdown for current episode
+
+        # Post-portal grace periods (Holy Mountain navigation)
+        self._post_portal_steps: int = 0  # suppress entry-portal proximity reward
+        self._hm_grace_steps: int   = 0   # suppress descent-based truncation in HM
 
         # Per-step event-detection state for VideoRecorder
         self._fast_mv_counter = 0        # consecutive steps with |vx|>120
@@ -259,6 +264,10 @@ class NoitaEnv(gym.Env):
         self.route_x                  = []
         self.route_y                  = []
         self.action_history           = []
+        self._ep_breakdown            = {}
+        self._post_portal_steps       = 0
+        self._hm_grace_steps          = 0
+        self._fast_mv_counter         = 0
         self._long_survival_triggered = False
 
         logger.debug("[env:{}] reset() — episode {}", self.port, self.episode_num)
@@ -343,6 +352,11 @@ class NoitaEnv(gym.Env):
             self.max_depth_y        = current_y
             self.visited_chunks     = set()
             self.steps_without_descent = 0
+            # Suppress entry-portal proximity pull for ~13 s (200 steps) so the
+            # agent explores HM rightward instead of turning back through entry portal.
+            self._post_portal_steps = 200
+            # Allow HM horizontal exploration without descent-based truncation.
+            self._hm_grace_steps    = 800
             logger.info(
                 "[env:{}] Post-portal spawn reset → ({:.0f}, {:.0f})",
                 self.port, current_x, current_y,
@@ -379,9 +393,14 @@ class NoitaEnv(gym.Env):
                 r_chunk = 0.5
 
         # 4. Truncation: no depth progress for 500 steps (~33 s).
+        # After a portal teleport, grant HM grace period so the agent can
+        # navigate the horizontal Holy Mountain without being truncated for
+        # "no descent" — HM is lateral, not vertical.
         truncated = False
         r_trunc = 0.0
-        if self.steps_without_descent > 500:
+        if self._hm_grace_steps > 0:
+            self._hm_grace_steps -= 1
+        elif self.steps_without_descent > 500:
             r_trunc = -2.0
             truncated = True
             self._send_action(-1)
@@ -411,22 +430,28 @@ class NoitaEnv(gym.Env):
             r_chests = (current_chests - self.last_chests) * 3.0
         self.last_chests = current_chests
 
-        # 5b. Aim-on-enemy bonus: tiny reward when FIRE pressed AND enemy in 250 px.
-        # Kept very small (0.01) so it can't be farmed — at 0.05 agents stand
-        # still and shoot indefinitely to accumulate this bonus instead of exploring.
+        # 5b. Aim-on-enemy bonus: tiny reward when wand FIRED AND enemy in 250 px.
+        # Fire actions: 8=fire_R … 16=fire_auto_enemy (excludes 17=fire_smart_loot).
+        # Kept at 0.01 so it can't be farmed — chunk/depth rewards dominate.
         r_fire = 0.0
-        if int(action) in (6, 7):
+        if int(action) in range(8, 17):   # 8..16 = all directional + auto-aim fire
             enemy_radar = state.get("enemy_radar", [1.0] * 8)
             if any(v < 0.9 for v in enemy_radar):
                 r_fire = 0.01
 
         # 5c. Portal proximity bonus + one-shot teleport reward (Holy Mountain).
+        # After a portal teleport, suppress the proximity pull for _post_portal_steps
+        # so the entry portal (right behind the agent) doesn't drag it back left.
         r_portal = 0.0
-        portal = state.get("portal", [1.0, 0.5, 0.5])
-        if isinstance(portal, list) and len(portal) == 3:
-            portal_dist = float(portal[0])
-            if portal_dist < 0.3:
-                r_portal = (0.3 - portal_dist) * 0.05
+        if self._post_portal_steps > 0:
+            self._post_portal_steps -= 1
+            # No proximity reward during grace — entry portal is nearby and misleading
+        else:
+            portal = state.get("portal", [1.0, 0.5, 0.5])
+            if isinstance(portal, list) and len(portal) == 3:
+                portal_dist = float(portal[0])
+                if portal_dist < 0.3:
+                    r_portal = (0.3 - portal_dist) * 0.05
         r_portal += portal_teleport_reward
 
         # 6. Death penalty
@@ -435,6 +460,12 @@ class NoitaEnv(gym.Env):
             r_death = -1.0
 
         reward = r_time + r_manh + r_depth + r_chunk + r_trunc + r_dmg + r_kills + r_chests + r_fire + r_portal + r_death
+
+        # Accumulate per-episode reward totals (sent at episode end for /plot analysis)
+        for _k, _v in (("time", r_time), ("manh", r_manh), ("depth", r_depth),
+                       ("chunk", r_chunk), ("fire", r_fire), ("portal", r_portal),
+                       ("kills", r_kills), ("dmg", r_dmg), ("death", r_death), ("trunc", r_trunc)):
+            self._ep_breakdown[_k] = self._ep_breakdown.get(_k, 0.0) + _v
 
         # Debug: log reward breakdown every 50 steps so we can see what's driving the policy
         if self.episode_steps % 50 == 0:
@@ -496,8 +527,8 @@ class NoitaEnv(gym.Env):
             else:
                 self._fast_mv_counter = 0
 
-            # 6. Wand kill in this step
-            if current_kills > self.last_kills and int(action) in (6, 7):
+            # 6. Wand kill in this step (fire actions 8-17, not KICK/JETPACK)
+            if current_kills > self.last_kills and int(action) in range(8, 18):
                 rec.trigger_event("wand_kill", {**ctx_base, "kills": current_kills})
 
             # 7. Long survival milestone — fires DURING the episode (at step 600)
@@ -516,21 +547,24 @@ class NoitaEnv(gym.Env):
             if max(wx) - min(wx) < 20 and max(wy) - min(wy) < 20:
                 visually_stuck = True
 
+        # Only IDLE (0) counts as a loop: standing still doing nothing.
+        # Movement (1-5), JETPACK (6), KICK (7), and fire (8-17) are all
+        # legitimate actions that should not trigger truncation.
+        _FARMABLE = {0}
         if len(self.action_history) >= 500:
             wa = self.action_history[-500:]
-            c = Counter(wa)
-            if c.most_common(1)[0][1] > 400:  # 80% of 500 steps same action
+            top_action, top_count = Counter(wa).most_common(1)[0]
+            if top_count > 400 and top_action in _FARMABLE:  # 80% IDLE
                 action_loop = True
 
         # Action-loop truncation: degenerate policy (e.g. fire/idle farming).
-        # 80% same action in 500 steps means the agent isn't learning anything.
         if action_loop and not truncated:
             reward -= 3.0
             truncated = True
             self._send_action(-1)
             logger.info(
-                "[env:{}] Truncated — action loop (same action >80%% of 500 steps, -3 penalty).",
-                self.port,
+                "[env:{}] Truncated — action loop (action {} >80%% of 500 steps, -3 penalty).",
+                self.port, self.action_history[-1],
             )
 
         if dead or truncated:
@@ -561,12 +595,7 @@ class NoitaEnv(gym.Env):
                 "noita/route_y":                self.route_y,
                 "noita/visually_stuck":         visually_stuck,
                 "noita/action_loop":            action_loop,
-                "noita/reward_breakdown": {
-                    "time": r_time, "manh": r_manh, "depth": r_depth,
-                    "chunk": r_chunk, "fire": r_fire, "portal": r_portal,
-                    "kills": r_kills, "dmg": r_dmg, "death": r_death,
-                    "trunc": r_trunc,
-                },
+                "noita/reward_breakdown": dict(self._ep_breakdown),  # cumulative episode totals
                 "noita/action_history": self.action_history,
             }
             with self._lock:

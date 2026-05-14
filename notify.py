@@ -256,11 +256,9 @@ class TelegramNotifier:
             from collections import Counter
             # Map action IDs to names
             ACTION_NAMES = {
-                0:"IDLE", 1:"L", 2:"R", 3:"UP", 4:"UL", 5:"UR",
-                6:"JETPK", 7:"KICK",
-                8:"F_R", 9:"F_UR", 10:"F_U", 11:"F_UL",
-                12:"F_L", 13:"F_DL", 14:"F_D", 15:"F_DR",
-                16:"F_AUTO", 17:"F_SMART"
+                0:"IDLE", 1:"LEFT", 2:"RIGHT", 3:"JUMP",
+                4:"L+JMP", 5:"R+JMP", 6:"FIRE", 7:"DIG↓",
+                8:"KICK", 9:"JETPACK",
             }
             counts = Counter(actions)
             labels = [ACTION_NAMES.get(a, str(a)) for a in counts.keys()]

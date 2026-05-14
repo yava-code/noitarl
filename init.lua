@@ -371,11 +371,16 @@ end
 
 -- ── Respawn: teleport to (possibly randomised) spawn, reset state ────────
 local function pick_spawn()
-    -- Choose one of the recorded anchor positions and jitter it slightly so
-    -- the agent doesn't overfit to a single corridor entrance.
+    -- Prefer the deepest recorded spawn points (higher Y = deeper in Noita).
+    -- Picking from the top-3 deepest candidates prevents the agent from
+    -- repeatedly respawning in narrow surface-adjacent corridors from early
+    -- episodes, while still keeping some variety.
     local n = #spawn_candidates
     if n == 0 then return spawn_x or 0.0, spawn_y or 0.0 end
-    local sp = spawn_candidates[math.random(n)]
+    local sorted = {}
+    for i = 1, n do sorted[i] = spawn_candidates[i] end
+    table.sort(sorted, function(a, b) return a.y > b.y end)
+    local sp = sorted[math.random(math.min(3, n))]
     local jx = math.random(-SPAWN_JITTER, SPAWN_JITTER)
     return sp.x + jx, sp.y
 end
@@ -597,7 +602,7 @@ end
 --   dy_norm   = 0.5 → portal at same Y; <0.5 above, >0.5 below
 -- Holy Mountain teleporters carry tag "teleport_active"; we try a couple of
 -- other tags too in case the engine renames them in different biomes.
-local PORTAL_RANGE = 400
+local PORTAL_RANGE = 600   -- increased from 400 so HM exit portal is visible from entry side
 local PORTAL_TAGS  = { "teleport_active", "portal", "teleportable_NOT_player" }
 
 local function get_portal_signal(x, y)
@@ -849,8 +854,8 @@ function OnWorldPostUpdate()
         -- First frame: drop the player from the surface into the Mines.
         -- We skip the first SKIP_SURFACE_PX of terrain so we don't land on
         -- the surface ledge — we want to be in the actual underground mines.
-        local SKIP_SURFACE_PX = 450  -- ignore surface terrain in first 450 px
-        local target_x, target_y = x, y + 700  -- fallback: guaranteed underground
+        local SKIP_SURFACE_PX = 50  -- ignore surface terrain in first 50 px
+        local target_x, target_y = x, y + 400  -- fallback: guaranteed underground
 
         -- Primary: find first platform below the surface layer.
         local rok, hit, _hx, hy = pcall(
@@ -862,8 +867,8 @@ function OnWorldPostUpdate()
 
         -- Safety: if we ended up suspiciously close to the starting y,
         -- the raycast hit surface terrain — push further down.
-        if math.abs(target_y - y) < 300 then
-            target_y = y + 700
+        if math.abs(target_y - y) < 100 then
+            target_y = y + 400
         end
 
         pcall(EntitySetTransform, player, target_x, target_y)
