@@ -383,7 +383,20 @@ class NoitaEnv(gym.Env):
         else:
             self.steps_without_descent += 1
 
+        # 2b. Dense downward bias — fires every step the agent moves deeper.
+        # Unlike r_depth (only on new record), this gives a gradient in corridors
+        # where the agent needs to go sideways before it can descend.
+        r_down_bias = 0.0
+        if prev_state is not None and not prev_state.get("dead", False):
+            _prev_y = prev_state.get("y", current_y)
+            _delta_y = current_y - _prev_y
+            if _delta_y > 0:
+                r_down_bias = _delta_y * 0.005
+
         # 3. Chunk curiosity — underground only (sky-farm guard).
+        # New chunk also resets the descent timer: horizontal navigation through
+        # corridors is progress, not stagnation.  Without this, the agent learns
+        # that any horizontal step is "bad" (timer runs toward TRUNC -2).
         r_chunk = 0.0
         chunk = (int(current_x // 32), int(current_y // 32))
         if chunk not in self.visited_chunks:
@@ -391,6 +404,7 @@ class NoitaEnv(gym.Env):
             sky_vis = float(state.get("sky_visibility", 0.0))
             if sky_vis < 0.3:
                 r_chunk = 0.5
+                self.steps_without_descent = 0   # exploration = progress
 
         # 4. Truncation: no depth progress for 500 steps (~33 s).
         # After a portal teleport, grant HM grace period so the agent can
@@ -439,18 +453,34 @@ class NoitaEnv(gym.Env):
             if any(v < 0.9 for v in enemy_radar):
                 r_fire = 0.01
 
+        # 5d. Terrain destruction bonus: wand fire visibly extended a ray = terrain broke.
+        # Maps each directional fire action to the ray index it fires along.
+        # Only rewards when ray actually gets longer (indestructible walls: no change → no reward).
+        # Equal to chunk reward (0.5) so agent prefers opening new paths over standing still.
+        r_dig = 0.0
+        _FIRE_TO_RAY = {8: 0, 9: 14, 10: 12, 11: 10, 12: 8, 13: 6, 14: 4, 15: 2}
+        if (int(action) in _FIRE_TO_RAY and
+                prev_state is not None and not prev_state.get("dead", False)):
+            _ri = _FIRE_TO_RAY[int(action)]
+            _pr = prev_state.get("rays", [])
+            _cr = state.get("rays", [])
+            if len(_pr) > _ri and len(_cr) > _ri and _cr[_ri] - _pr[_ri] > 0.1:
+                r_dig = 0.5   # ray extended >15 px: terrain was destroyed
+
         # 5c. Portal proximity bonus + one-shot teleport reward (Holy Mountain).
-        # After a portal teleport, suppress the proximity pull for _post_portal_steps
-        # so the entry portal (right behind the agent) doesn't drag it back left.
+        # During _post_portal_steps: suppress ALL proximity (entry portal right behind agent).
+        # During _hm_grace_steps: only reward portals that are to the RIGHT (exit portal)
+        # so the entry portal (to the left) doesn't pull the agent back.
         r_portal = 0.0
         if self._post_portal_steps > 0:
             self._post_portal_steps -= 1
-            # No proximity reward during grace — entry portal is nearby and misleading
         else:
             portal = state.get("portal", [1.0, 0.5, 0.5])
             if isinstance(portal, list) and len(portal) == 3:
                 portal_dist = float(portal[0])
-                if portal_dist < 0.3:
+                portal_dx   = float(portal[1])   # 0.5=same X, >0.5=right, <0.5=left
+                in_hm = self._hm_grace_steps > 0
+                if portal_dist < 0.3 and (not in_hm or portal_dx > 0.5):
                     r_portal = (0.3 - portal_dist) * 0.05
         r_portal += portal_teleport_reward
 
@@ -459,11 +489,12 @@ class NoitaEnv(gym.Env):
         if dead and current_hp <= 0:
             r_death = -1.0
 
-        reward = r_time + r_manh + r_depth + r_chunk + r_trunc + r_dmg + r_kills + r_chests + r_fire + r_portal + r_death
+        reward = r_time + r_manh + r_depth + r_down_bias + r_chunk + r_dig + r_trunc + r_dmg + r_kills + r_chests + r_fire + r_portal + r_death
 
         # Accumulate per-episode reward totals (sent at episode end for /plot analysis)
         for _k, _v in (("time", r_time), ("manh", r_manh), ("depth", r_depth),
-                       ("chunk", r_chunk), ("fire", r_fire), ("portal", r_portal),
+                       ("down", r_down_bias), ("chunk", r_chunk), ("dig", r_dig),
+                       ("fire", r_fire), ("portal", r_portal),
                        ("kills", r_kills), ("dmg", r_dmg), ("death", r_death), ("trunc", r_trunc)):
             self._ep_breakdown[_k] = self._ep_breakdown.get(_k, 0.0) + _v
 
@@ -471,10 +502,10 @@ class NoitaEnv(gym.Env):
         if self.episode_steps % 50 == 0:
             logger.debug(
                 "[env:{}] reward breakdown: time={:+.3f} manh={:+.3f} depth={:+.3f}"
-                " chunk={:+.2f} fire={:+.2f} portal={:+.3f} kills={:+.1f}"
-                " dmg={:+.2f} death={:+.1f} total={:+.4f}",
-                self.port, r_time, r_manh, r_depth, r_chunk, r_fire, r_portal,
-                r_kills, r_dmg, r_death, reward,
+                " down={:+.3f} chunk={:+.2f} dig={:+.2f} fire={:+.2f} portal={:+.3f}"
+                " kills={:+.1f} dmg={:+.2f} death={:+.1f} total={:+.4f}",
+                self.port, r_time, r_manh, r_depth, r_down_bias, r_chunk, r_dig,
+                r_fire, r_portal, r_kills, r_dmg, r_death, reward,
             )
 
         self.last_hp         = current_hp

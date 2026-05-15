@@ -38,7 +38,7 @@ class Config(BaseSettings):
     gamma: float         = Field(0.99, ge=0, le=1)
     gae_lambda: float    = Field(0.95, ge=0, le=1)
     clip_range: float    = Field(0.2, gt=0, lt=1)
-    ent_coef: float      = Field(0.015, ge=0.0, le=1.0)  # slightly lower exploration noise
+    ent_coef: float      = Field(0.03, ge=0.0, le=1.0)   # raised: 0.015 too low after policy converges
     vf_coef: float       = Field(0.5,  gt=0.0)
     max_grad_norm: float = Field(0.5,  gt=0.0)
 
