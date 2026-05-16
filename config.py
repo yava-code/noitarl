@@ -42,6 +42,12 @@ class Config(BaseSettings):
     vf_coef: float       = Field(0.5,  gt=0.0)
     max_grad_norm: float = Field(0.5,  gt=0.0)
 
+    # ── Computer Vision (image obs branch) ───────────────────────────────────
+    cv_enabled: bool      = True
+    image_size: int       = Field(84, ge=32, le=256)    # square HxW for the CNN input
+    image_channels: int   = Field(1, ge=1, le=3)         # 1=grayscale, 3=RGB
+    frame_stack: int      = Field(4, ge=1, le=8)         # temporal stack fed to NatureCNN
+
     # ── Checkpoints ───────────────────────────────────────────────────────────
     checkpoint_dir: str  = "./checkpoints"
     checkpoint_freq: int = Field(100_000, ge=1_000)

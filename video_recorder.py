@@ -119,9 +119,13 @@ class VideoRecorder:
     SAVE_DIR      = "data/highlights"
     MAX_LOCAL_GIFS = 100        # keep only the last N most interesting/recent gifs locally
 
-    def __init__(self, notifier, groq_api_key: str = ""):
+    def __init__(self, notifier, groq_api_key: str = "", pid: Optional[int] = None):
         self._notifier   = notifier
         self._groq_key   = groq_api_key.strip()
+        # When several Noita instances run side-by-side, EnumWindows returns
+        # the first match. Pin the recorder to a specific PID so the GIF
+        # doesn't ping-pong between two windows.
+        self._pid: Optional[int] = pid
 
         pre_len = self.CAPTURE_FPS * self.PRE_SEC
         self._pre_buf: collections.deque = collections.deque(maxlen=pre_len)
@@ -210,11 +214,11 @@ class VideoRecorder:
     def _grab_frame(self) -> Optional[Image.Image]:
         hwnd = self._window_hwnd
         if hwnd is None:
-            hwnd = self._find_noita_hwnd()
+            hwnd = self._find_noita_hwnd(pid_filter=self._pid)
             if hwnd is None:
                 return None
             self._window_hwnd = hwnd
-            logger.debug("VideoRecorder: found Noita hwnd={}", hwnd)
+            logger.debug("VideoRecorder: found Noita hwnd={} pid={}", hwnd, self._pid)
         img = self._print_window(hwnd)
         if img is None:
             self._window_hwnd = None
@@ -222,11 +226,15 @@ class VideoRecorder:
         return img.resize((self.FRAME_W, self.FRAME_H), Image.LANCZOS)
 
     @staticmethod
-    def _find_noita_hwnd() -> Optional[int]:
+    def _find_noita_hwnd(pid_filter: Optional[int] = None) -> Optional[int]:
         """
         Return HWND of the Noita game window, identified by process executable
         name (noita.exe / noita_dev.exe) — NOT by window title, so browser tabs
         named 'noita-rl-...' are never mistakenly matched.
+
+        If ``pid_filter`` is given, only a window owned by that specific PID is
+        accepted. This is required when running multiple Noita instances side
+        by side so each env's recorder stays pinned to its own window.
         """
         try:
             import ctypes
@@ -245,6 +253,8 @@ class VideoRecorder:
                 pid = wt.DWORD()
                 user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
                 if not pid.value:
+                    return True
+                if pid_filter is not None and pid.value != pid_filter:
                     return True
                 hproc = k32.OpenProcess(PROCESS_QUERY_LIMITED, False, pid.value)
                 if not hproc:

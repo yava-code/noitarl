@@ -152,8 +152,22 @@ def train(args: argparse.Namespace) -> None:
         except Exception:
             device = "auto"
         logger.info("PPO device: {}", device)
+
+        # CV-branch: Dict obs → MultiInputPolicy (CombinedExtractor = NatureCNN(image) + flatten(sensors))
+        if cfg.cv_enabled:
+            policy_name = "MultiInputPolicy"
+            policy_kwargs = dict(
+                features_extractor_kwargs=dict(cnn_output_dim=256),
+                net_arch=dict(pi=[256, 128], vf=[256, 128]),
+            )
+            logger.info("Policy: MultiInputPolicy (CNN+MLP fusion, image {0}x{0} x{1})",
+                        cfg.image_size, cfg.frame_stack)
+        else:
+            policy_name = "MlpPolicy"
+            policy_kwargs = None
+
         model = PPO(
-            "MlpPolicy",
+            policy_name,
             env,
             verbose          = 1,
             learning_rate    = cfg.learning_rate,
@@ -168,6 +182,7 @@ def train(args: argparse.Namespace) -> None:
             max_grad_norm    = cfg.max_grad_norm,
             tensorboard_log  = cfg.tensorboard_dir,
             device           = device,
+            policy_kwargs    = policy_kwargs,
         )
 
     # ── Callbacks ─────────────────────────────────────────────────────────────

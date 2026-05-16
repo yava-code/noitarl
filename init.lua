@@ -155,6 +155,12 @@ local last_action      = 0
 local last_facing      = 1     -- last non-zero horizontal direction (for KICK aim)
 local last_kick_frame  = -1000
 local agent_was_firing = false -- Track fire state locally so engine hardware poll doesn't break it
+-- Camera-jitter fix: only rewrite ControlsComponent aim when it actually changes.
+-- Noita's camera follows the aim cursor; rewriting it every action-frame caused
+-- visible "convulsions" 3-5x/sec. Track last applied aim so we can skip no-op writes.
+local last_aim_type     = -1
+local last_aim_target_x = nil
+local last_aim_target_y = nil
 local ACTION_NAMES    = {
     [0]="IDLE", [1]="L", [2]="R", [3]="UP", [4]="UL", [5]="UR",
     [6]="JETPK", [7]="KICK",
@@ -330,16 +336,34 @@ local function apply_action(player, action)
             local len = math.sqrt(dx*dx + dy*dy)
             if len > 0.001 then
                 local nxv, nyv = dx/len, dy/len
-                cset(ctrl, "mAimingVectorNormalized", nxv, nyv)
-                cset(ctrl, "mAimingVector",           nxv * 40, nyv * 40)
-                cset(ctrl, "mMousePosition",          nx, ny)
-                cset(ctrl, "mMousePositionRaw",       nx, ny)
-                cset(ctrl, "mGamePadCursorInWorld",   nx, ny)
-                cset(ctrl, "mGamepadIndirectAiming",  nxv, nyv)
 
-                local pspc = EntityGetFirstComponent(player, "PlatformShooterPlayerComponent")
-                if pspc then cset(pspc, "mSmoothedAimingVector", nxv, nyv) end
-                
+                -- Camera-jitter fix: only rewrite the aim cursor when the agent is
+                -- actually firing, the aim mode changed, or an enemy/loot target
+                -- moved far enough to matter. For pure-movement actions (aim_type==0)
+                -- we leave the cursor where the engine last had it.
+                local target_moved =
+                    last_aim_target_x and
+                    (math.abs(nx - last_aim_target_x) > 30
+                     or math.abs(ny - last_aim_target_y) > 30)
+                local should_update_aim =
+                    do_fire
+                    or aim_type ~= last_aim_type
+                    or (aim_type >= 2 and target_moved)
+
+                if aim_type ~= 0 and should_update_aim then
+                    cset(ctrl, "mAimingVectorNormalized", nxv, nyv)
+                    cset(ctrl, "mAimingVector",           nxv * 40, nyv * 40)
+                    cset(ctrl, "mMousePosition",          nx, ny)
+                    cset(ctrl, "mMousePositionRaw",       nx, ny)
+                    cset(ctrl, "mGamePadCursorInWorld",   nx, ny)
+                    cset(ctrl, "mGamepadIndirectAiming",  nxv, nyv)
+                    -- Intentionally NOT touching mSmoothedAimingVector — leave
+                    -- engine interpolation alone so the camera glides instead of snapping.
+                    last_aim_type, last_aim_target_x, last_aim_target_y = aim_type, nx, ny
+                end
+
+                -- Facing always tracks intent so KICK / sprites stay correct, but
+                -- this single int doesn't move the camera.
                 local cplat = EntityGetFirstComponent(player, "CharacterPlatformingComponent")
                 if cplat then cset(cplat, "mFacingDirection", (nxv >= 0) and 1 or -1) end
             end
@@ -998,6 +1022,15 @@ function OnWorldPostUpdate()
         return
     end
 
+    -- Camera centre (world coords) — Python side uses this to compute the
+    -- player's on-screen pixel position for the CNN crop.
+    local cam_ok, cam_x, cam_y = pcall(GameGetCameraPos)
+    if not cam_ok then cam_x, cam_y = x, y end
+    -- Camera viewport size in world units (covers any zoom changes the player
+    -- makes in-game). w/h are equivalent to screen pixels at default zoom.
+    local cb_ok, _cbx, _cby, cb_w, cb_h = pcall(GameGetCameraBounds)
+    if not cb_ok then cb_w, cb_h = 0, 0 end
+
     -- Send live state ──────────────────────────────────────────────────────
     local state = {
         x=x, y=y, hp=hp_norm, vx=vx, vy=vy,
@@ -1008,7 +1041,8 @@ function OnWorldPostUpdate()
         is_on_fire=is_on_fire, is_poisoned=is_poisoned,
         sky_visibility=sky_visibility, gold=gold, kills=kills,
         chests=chests_opened_ep,
-        dead=false, on_ground=on_ground, frame=frame
+        dead=false, on_ground=on_ground, frame=frame,
+        cam_x=cam_x, cam_y=cam_y, cam_w=cb_w, cam_h=cb_h,
     }
     local ok5, encoded = pcall(json.encode, state)
     if ok5 then
