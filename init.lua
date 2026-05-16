@@ -348,11 +348,13 @@ local function apply_action(player, action)
         -- Fire: Fix "eternal first frame" bug by using local agent_was_firing
         cset(ctrl, "mButtonDownFire",      do_fire)
         cset(ctrl, "mButtonDownLeftClick", do_fire)
+        cset(ctrl, "mButtonDownAction",    do_fire)
         
         if do_fire and not agent_was_firing then
             local frame = GameGetFrameNum()
             cset(ctrl, "mButtonFrameFire",      frame)
             cset(ctrl, "mButtonFrameLeftClick", frame)
+            cset(ctrl, "mButtonFrameAction",    frame)
             agent_was_firing = true
         elseif not do_fire then
             agent_was_firing = false
