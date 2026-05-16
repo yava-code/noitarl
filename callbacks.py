@@ -325,17 +325,28 @@ class NoitaMonitorCallback(BaseCallback):
 
             # W&B per-episode
             if self._cfg.wandb_enabled and _WANDB_OK and wandb.run is not None:
-                wandb.log({
+                wandb_log_dict = {
                     "episode/reward":         r,
                     "episode/length":         l,
                     "episode/visited_chunks": chunks,
                     "episode/spawn_distance": dist,
                     "episode/max_depth":      depth,
+                    "episode/max_x":          max_x,
                     "episode/kills":          kills,
+                    "episode/chests_opened":  chests_opened,
                     "episode/total_damage":   total_damage,
                     "episode/run_time_s":     run_time,
+                    "episode/visually_stuck": int(visually_stuck),
+                    "episode/action_loop":    int(action_loop),
                     "episode/total":          self._total_episodes,
-                }, step=self.num_timesteps)
+                }
+
+                # Add reward breakdown
+                if self._last_reward_breakdown:
+                    for k, v in self._last_reward_breakdown.items():
+                        wandb_log_dict[f"reward_breakdown/{k}"] = v
+
+                wandb.log(wandb_log_dict, step=self.num_timesteps)
 
         # Periodic Telegram update
         steps_since = self.num_timesteps - self._last_tg
@@ -453,6 +464,9 @@ class NoitaMonitorCallback(BaseCallback):
     def _send_tg_update(self) -> None:
         pct = self.num_timesteps / max(self._cfg.total_timesteps, 1) * 100
         mean_r = float(np.mean(self._ep_rewards)) if self._ep_rewards else 0.0
+        mean_l = float(np.mean(self._ep_lengths)) if self._ep_lengths else 0.0
+        mean_d = float(np.mean(self._ep_distances)) if self._ep_distances else 0.0
+        mean_dp = float(np.mean(self._ep_depths)) if self._ep_depths else 0.0
         elapsed = time.time() - self._start_ts
         eta_s = (self._cfg.total_timesteps - self.num_timesteps) / max(
             self.num_timesteps / max(elapsed, 1), 1
@@ -463,6 +477,10 @@ class NoitaMonitorCallback(BaseCallback):
             f"[{bar}] {pct:.1f}%\n"
             f"Steps: {self.num_timesteps:,}\n"
             f"Mean reward: {mean_r:.2f}\n"
+            f"Mean length: {mean_l:.1f}\n"
+            f"Mean distance: {mean_d:.1f}\n"
+            f"Mean depth: {mean_dp:.1f}\n"
+            f"Episodes: {self._total_episodes}\n"
             f"ETA: {eta_s/3600:.1f} h"
         )
 

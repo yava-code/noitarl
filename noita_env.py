@@ -70,6 +70,9 @@ def _capture_noita_frame() -> "Optional[Image.Image]":
 
 def _find_noita_hwnd_by_pid(target_pid: int) -> Optional[int]:
     """Return the visible top-level HWND owned by the given Noita process, or None."""
+    if win32gui is None or win32process is None:
+        return None
+
     found: list[int] = []
 
     def _cb(hwnd: int, _lparam) -> bool:
@@ -100,6 +103,9 @@ def _dismiss_error_dialog(target_pid: Optional[int] = None) -> bool:
     Searches for Noita error/crash dialogs and clicks the 'Always Ignore'
     button if present to prevent the training from hanging.
     """
+    if win32gui is None or win32process is None:
+        return False
+
     BM_CLICK = 0x00F5
     clicked = False
 
@@ -156,6 +162,9 @@ def _dismiss_error_dialog(target_pid: Optional[int] = None) -> bool:
 
 def _find_any_noita_hwnd() -> Optional[int]:
     """Fallback: any visible window with 'Noita' in the title (single-instance mode)."""
+    if win32gui is None:
+        return None
+
     found: list[int] = []
 
     def _cb(hwnd: int, _lparam) -> bool:
