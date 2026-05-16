@@ -44,7 +44,7 @@ class TestDefaults:
         assert cfg().gamma == pytest.approx(0.99)
 
     def test_default_ent_coef(self):
-        assert cfg().ent_coef == pytest.approx(0.015)
+        assert cfg().ent_coef == pytest.approx(0.03)
 
     def test_default_checkpoint_dir(self):
         assert cfg().checkpoint_dir == "./checkpoints"
