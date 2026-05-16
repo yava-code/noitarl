@@ -2,32 +2,73 @@
 __pycache__/
 *.py[cod]
 *$py.class
-.venv/
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
 venv/
-venv_rl/
+env/
+.venv/
 .env
 
-# Noita & ML Logs
-logger.txt
-noita_ppo_tensorboard/
-*.log
-
-# Models & Data
-*.zip
-*.pth
-*.h5
-
-# IDEs
+# IDE
 .idea/
 .vscode/
+*.swp
+*.swo
+*~
+
+# OS
 .DS_Store
-/wandb/
-/docs/superpowers/plans/2026-05-09-noita-rl-mvp.md
-/docs/superpowers/specs/2026-05-09-noita-rl-mvp-design.md
-/data/hall_of_fame/
-/data/highlights/
-/data/schemas/
-/crashes/
-/playbacks/
-/save00/
-/start_training.bat
+Thumbs.db
+
+# Noita RL specific
+crashes/
+*.dmp
+*.jsonl
+checkpoints/
+*.pt
+*.pth
+logs/
+*.log
+data/episode_history.csv
+data/schemas/*.xml
+
+# Binaries (keep pollnet.dll but ignore others)
+!bin/pollnet.dll
+*.exe
+*.dll
+!bin/*.dll
+
+# Secrets
+.env
+*.key
+*.pem
+
+# Jupyter
+.ipynb_checkpoints/
+
+# pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
