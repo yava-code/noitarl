@@ -18,7 +18,7 @@ def make_env():
     import importlib, types, sys
 
     # Stub out hardware-dependent top-level imports that run at module load
-    for mod_name in ("mss", "pygetwindow"):
+    for mod_name in ("mss", "pygetwindow", "win32gui"):
         if mod_name not in sys.modules:
             sys.modules[mod_name] = types.ModuleType(mod_name)
 
