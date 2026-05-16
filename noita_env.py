@@ -46,6 +46,14 @@ from loguru import logger
 # still works. Each env instance owns its own mss handle (mss is not thread-safe).
 import cv2
 import mss
+try:
+    import win32gui
+except ImportError:
+    win32gui = None
+try:
+    import win32process
+except ImportError:
+    win32process = None
 
 
 def _capture_noita_frame() -> "Optional[Image.Image]":
@@ -62,6 +70,9 @@ def _capture_noita_frame() -> "Optional[Image.Image]":
 
 def _find_noita_hwnd_by_pid(target_pid: int) -> Optional[int]:
     """Return the visible top-level HWND owned by the given Noita process, or None."""
+    if win32gui is None or win32process is None:
+        return None
+
     found: list[int] = []
 
     def _cb(hwnd: int, _lparam) -> bool:
@@ -86,8 +97,74 @@ def _find_noita_hwnd_by_pid(target_pid: int) -> Optional[int]:
     return found[0] if found else None
 
 
+
+def _dismiss_error_dialog(target_pid: Optional[int] = None) -> bool:
+    """
+    Searches for Noita error/crash dialogs and clicks the 'Always Ignore'
+    button if present to prevent the training from hanging.
+    """
+    if win32gui is None or win32process is None:
+        return False
+
+    BM_CLICK = 0x00F5
+    clicked = False
+
+    def _enum_child_cb(child_hwnd: int, _lparam) -> bool:
+        nonlocal clicked
+        if not win32gui.IsWindowVisible(child_hwnd):
+            return True
+        child_title = win32gui.GetWindowText(child_hwnd) or ""
+        child_title_lower = child_title.lower()
+        if "ignore" in child_title_lower and "always" in child_title_lower:
+            try:
+                # SendMessage is blocking, PostMessage is async
+                import win32con
+                import win32api
+                win32api.PostMessage(child_hwnd, BM_CLICK, 0, 0)
+                logger.info("Dismissed Noita crash dialog: clicked '{}' (hwnd: {})", child_title, child_hwnd)
+                clicked = True
+            except Exception as e:
+                logger.debug("Failed to click dialog button: {}", e)
+        return True
+
+    def _enum_windows_cb(hwnd: int, _lparam) -> bool:
+        if not win32gui.IsWindowVisible(hwnd):
+            return True
+
+        try:
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+        except Exception:
+            return True
+
+        if target_pid is not None and pid != target_pid:
+            # If target PID is provided, only look at dialogs owned by it
+            return True
+
+        title = win32gui.GetWindowText(hwnd) or ""
+        title_lower = title.lower()
+
+        # Check if this might be an error dialog (usually they have 'Noita' or 'Error' in title,
+        # but their class is often '#32770' for standard dialogs).
+        class_name = win32gui.GetClassName(hwnd)
+        if "noita" in title_lower or "error" in title_lower or class_name == "#32770":
+            try:
+                win32gui.EnumChildWindows(hwnd, _enum_child_cb, None)
+            except Exception:
+                pass
+        return True
+
+    try:
+        win32gui.EnumWindows(_enum_windows_cb, None)
+    except Exception as exc:
+        logger.debug("EnumWindows failed during dialog check: {}", exc)
+
+    return clicked
+
 def _find_any_noita_hwnd() -> Optional[int]:
     """Fallback: any visible window with 'Noita' in the title (single-instance mode)."""
+    if win32gui is None:
+        return None
+
     found: list[int] = []
 
     def _cb(hwnd: int, _lparam) -> bool:
@@ -545,7 +622,9 @@ class NoitaEnv(gym.Env):
             if s is not None and s.get("frame", -1) != prev_frame:
                 return s
             time.sleep(0.008)   # poll every 8 ms (~2x per Noita frame at 60fps)
-        # timeout — return whatever we have (Noita may be loading/paused)
+
+        # timeout — return whatever we have (Noita may be loading/paused/crashed)
+        _dismiss_error_dialog(self.noita_pid)
         return self._get_state()
 
     def step(self, action: int):
