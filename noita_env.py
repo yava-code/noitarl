@@ -46,8 +46,14 @@ from loguru import logger
 # still works. Each env instance owns its own mss handle (mss is not thread-safe).
 import cv2
 import mss
-import win32gui
-import win32process
+try:
+    import win32gui
+except ImportError:
+    win32gui = None
+try:
+    import win32process
+except ImportError:
+    win32process = None
 
 
 def _capture_noita_frame() -> "Optional[Image.Image]":
@@ -106,8 +112,8 @@ def _dismiss_error_dialog(target_pid: Optional[int] = None) -> bool:
         if "ignore" in child_title_lower and "always" in child_title_lower:
             try:
                 # SendMessage is blocking, PostMessage is async
-                import win32api
                 import win32con
+                import win32api
                 win32api.PostMessage(child_hwnd, BM_CLICK, 0, 0)
                 logger.info("Dismissed Noita crash dialog: clicked '{}' (hwnd: {})", child_title, child_hwnd)
                 clicked = True
