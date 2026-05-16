@@ -46,8 +46,6 @@ from loguru import logger
 # still works. Each env instance owns its own mss handle (mss is not thread-safe).
 import cv2
 import mss
-import win32gui
-import win32process
 
 
 def _capture_noita_frame() -> "Optional[Image.Image]":

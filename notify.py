@@ -579,9 +579,14 @@ class TelegramNotifier:
                         # and times out after 10 s. Handlers can take much longer.
                         self._answer_callback_query(cq_id)
                         if handler:
-                            def _run(h=handler, d=data):
+                            def _run(h=handler, d=data, cmd_str=cmd):
                                 try:
-                                    h()
+                                    import inspect
+                                    sig = inspect.signature(h)
+                                    if len(sig.parameters) > 0:
+                                        h(cmd_str)
+                                    else:
+                                        h()
                                 except Exception as exc:
                                     logger.warning("Telegram callback handler '{}' raised: {}", d, exc)
                             threading.Thread(target=_run, daemon=True, name=f"tg-cb-{data}").start()

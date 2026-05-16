@@ -186,7 +186,7 @@ class TestCooldown:
 
 class TestWindowDetection:
     def test_find_returns_none_when_no_noita(self):
-        result = VideoRecorder._find_noita_window()
+        result = VideoRecorder._find_noita_hwnd()
         # pygetwindow is stubbed to return []
         assert result is None
 
