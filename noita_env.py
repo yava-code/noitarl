@@ -35,12 +35,19 @@ import json
 import threading
 import time
 from typing import Any, Optional
-from collections import Counter
+from collections import Counter, deque
 
 import numpy as np
 import websockets
 import gymnasium as gym
 from loguru import logger
+
+# CV-branch imports — lazy at module level so headless / no-Noita-yet startup
+# still works. Each env instance owns its own mss handle (mss is not thread-safe).
+import cv2
+import mss
+import win32gui
+import win32process
 
 
 def _capture_noita_frame() -> "Optional[Image.Image]":
@@ -55,20 +62,101 @@ def _capture_noita_frame() -> "Optional[Image.Image]":
         return None
 
 
+def _find_noita_hwnd_by_pid(target_pid: int) -> Optional[int]:
+    """Return the visible top-level HWND owned by the given Noita process, or None."""
+    found: list[int] = []
+
+    def _cb(hwnd: int, _lparam) -> bool:
+        if not win32gui.IsWindowVisible(hwnd):
+            return True
+        try:
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+        except Exception:
+            return True
+        if pid != target_pid:
+            return True
+        title = win32gui.GetWindowText(hwnd) or ""
+        # Noita's main window is titled "Noita"; skip console/helper windows.
+        if "Noita" in title:
+            found.append(hwnd)
+        return True
+
+    try:
+        win32gui.EnumWindows(_cb, None)
+    except Exception as exc:
+        logger.debug("EnumWindows failed: {}", exc)
+    return found[0] if found else None
+
+
+def _find_any_noita_hwnd() -> Optional[int]:
+    """Fallback: any visible window with 'Noita' in the title (single-instance mode)."""
+    found: list[int] = []
+
+    def _cb(hwnd: int, _lparam) -> bool:
+        if not win32gui.IsWindowVisible(hwnd):
+            return True
+        title = win32gui.GetWindowText(hwnd) or ""
+        if title.strip() == "Noita":
+            found.append(hwnd)
+        return True
+
+    try:
+        win32gui.EnumWindows(_cb, None)
+    except Exception:
+        pass
+    return found[0] if found else None
+
+
 class NoitaEnv(gym.Env):
     metadata = {"render_modes": ["human"]}
 
     # ── Construction ──────────────────────────────────────────────────────────
 
-    def __init__(self, host: str = "localhost", port: int = 5001):
+    def __init__(
+        self,
+        host: str = "localhost",
+        port: int = 5001,
+        *,
+        cv_enabled: Optional[bool] = None,
+        image_size: Optional[int] = None,
+        frame_stack: Optional[int] = None,
+        noita_pid: Optional[int] = None,
+    ):
         super().__init__()
         self.host = host
         self.port = port
 
+        # Pull defaults from Config (env vars / .env / defaults).
+        from config import Config
+        _cfg = Config()
+        self.cv_enabled  = bool(_cfg.cv_enabled) if cv_enabled is None else bool(cv_enabled)
+        self.image_size  = int(_cfg.image_size)  if image_size  is None else int(image_size)
+        self.frame_stack = int(_cfg.frame_stack) if frame_stack is None else int(frame_stack)
+
+        # CV state — lazy hwnd discovery (Noita may not be running yet at construct time).
+        self.noita_pid: Optional[int] = noita_pid
+        self._hwnd: Optional[int] = None
+        self._sct: Optional[mss.base.MSSBase] = None  # mss instance per env (not thread-safe to share)
+        self._frame_buf: deque = deque(maxlen=self.frame_stack)
+
         self.action_space = gym.spaces.Discrete(18)
-        self.observation_space = gym.spaces.Box(
-            low=0.0, high=1.0, shape=(60,), dtype=np.float32
-        )
+        # +1 channel: synthetic aim overlay (drawn from last action).
+        self._image_channels_total = self.frame_stack + 1
+        if self.cv_enabled:
+            self.observation_space = gym.spaces.Dict({
+                "image": gym.spaces.Box(
+                    low=0, high=255,
+                    shape=(self._image_channels_total, self.image_size, self.image_size),
+                    dtype=np.uint8,
+                ),
+                "sensors": gym.spaces.Box(
+                    low=0.0, high=1.0, shape=(60,), dtype=np.float32,
+                ),
+            })
+        else:
+            self.observation_space = gym.spaces.Box(
+                low=0.0, high=1.0, shape=(60,), dtype=np.float32
+            )
 
         # WebSocket state (written by WS thread, read by main thread)
         self._ws:    Optional[Any]  = None
@@ -206,7 +294,168 @@ class NoitaEnv(gym.Env):
             time.sleep(0.1)
         return False
 
+    # ── CV branch ─────────────────────────────────────────────────────────────
+
+    def _ensure_capture(self) -> bool:
+        """Lazily acquire HWND for this env's Noita instance + mss handle."""
+        if self._sct is None:
+            try:
+                self._sct = mss.mss()
+            except Exception as exc:
+                logger.debug("[env:{}] mss init failed: {}", self.port, exc)
+                return False
+        if self._hwnd is None:
+            if self.noita_pid is not None:
+                self._hwnd = _find_noita_hwnd_by_pid(self.noita_pid)
+            if self._hwnd is None:
+                # Fallback: pick any "Noita" window. In multi-env this will collide
+                # between instances — pass noita_pid to disambiguate.
+                self._hwnd = _find_any_noita_hwnd()
+        return self._hwnd is not None
+
+    # World-space crop around player (radius in world units, 1:1 with screen
+    # pixels at Noita's default zoom). 160 ⇒ a 320×320 world-unit square,
+    # roughly 20 player heights — tight enough to expose materials and enemies,
+    # wide enough to include the closest projectile / wall the agent can hit.
+    CROP_HALF_WORLD = 160.0
+
+    def _grab_frame(self, state: Optional[dict]) -> np.ndarray:
+        """Grab the Noita client area, crop a square around the player, return
+        a (H, W) uint8 grayscale image."""
+        size = self.image_size
+        blank = np.zeros((size, size), dtype=np.uint8)
+        if not self._ensure_capture():
+            return blank
+        try:
+            # Skip captures while the window is minimised — GetClientRect
+            # returns zero size, which would crash mss.
+            left, top, right, bottom = win32gui.GetClientRect(self._hwnd)
+            cw, ch = right - left, bottom - top
+            if cw < 8 or ch < 8:
+                return blank
+            sx, sy = win32gui.ClientToScreen(self._hwnd, (0, 0))
+            shot = self._sct.grab({"left": sx, "top": sy, "width": cw, "height": ch})
+            arr = np.asarray(shot, dtype=np.uint8)  # BGRA, shape (ch, cw, 4)
+            gray = cv2.cvtColor(arr, cv2.COLOR_BGRA2GRAY)
+
+            # Determine the world→pixel scale from camera bounds. Falls back to
+            # whole-window resize when we have no camera info yet (first reset).
+            cam_w = float(state.get("cam_w", 0.0)) if state else 0.0
+            cam_h = float(state.get("cam_h", 0.0)) if state else 0.0
+            px    = float(state.get("x", 0.0))     if state else 0.0
+            py    = float(state.get("y", 0.0))     if state else 0.0
+            cam_x = float(state.get("cam_x", px))  if state else 0.0
+            cam_y = float(state.get("cam_y", py))  if state else 0.0
+            if cam_w > 8 and cam_h > 8:
+                px_per_unit_x = cw / cam_w
+                px_per_unit_y = ch / cam_h
+                # Player pixel in the captured frame (camera centre maps to
+                # frame centre in Noita).
+                ppx = int(round((px - cam_x) * px_per_unit_x + cw / 2))
+                ppy = int(round((py - cam_y) * px_per_unit_y + ch / 2))
+                half_x = int(round(self.CROP_HALF_WORLD * px_per_unit_x))
+                half_y = int(round(self.CROP_HALF_WORLD * px_per_unit_y))
+                # Clamp the crop window inside the captured frame; if the
+                # player is at the edge we shift the window in rather than
+                # zero-pad (keeps the CNN seeing a consistent scale).
+                x0 = max(0, min(cw - 2 * half_x, ppx - half_x))
+                y0 = max(0, min(ch - 2 * half_y, ppy - half_y))
+                x1 = min(cw, x0 + 2 * half_x)
+                y1 = min(ch, y0 + 2 * half_y)
+                crop = gray[y0:y1, x0:x1]
+                if crop.size == 0:
+                    crop = gray
+            else:
+                crop = gray
+            return cv2.resize(crop, (size, size), interpolation=cv2.INTER_AREA)
+        except Exception as exc:
+            # HWND may have died (Noita restart). Force re-discovery next time.
+            logger.debug("[env:{}] _grab_frame failed, dropping hwnd: {}", self.port, exc)
+            self._hwnd = None
+            return blank
+
+    # Mapping fire action → unit aim vector (dx, dy) in screen coords (y-down).
+    _FIRE_DIRS = {
+        8:  ( 1.0,  0.0),   # fire_R
+        9:  ( 0.7071, -0.7071),  # fire_UR
+        10: ( 0.0, -1.0),   # fire_U
+        11: (-0.7071, -0.7071),  # fire_UL
+        12: (-1.0,  0.0),   # fire_L
+        13: (-0.7071,  0.7071),  # fire_DL
+        14: ( 0.0,  1.0),   # fire_D
+        15: ( 0.7071,  0.7071),  # fire_DR
+    }
+
+    def _aim_channel(self, state: Optional[dict]) -> np.ndarray:
+        """Synthetic image channel: white line from centre toward the agent's
+        current aim direction. Empty for non-fire actions, which lets the CNN
+        learn 'no line' = 'just moving / not shooting'."""
+        size = self.image_size
+        arr = np.zeros((size, size), dtype=np.uint8)
+        if not self.action_history:
+            return arr
+        last_act = int(self.action_history[-1])
+
+        direction: Optional[tuple[float, float]] = None
+        if last_act in self._FIRE_DIRS:
+            direction = self._FIRE_DIRS[last_act]
+        elif last_act == 16 and state is not None:
+            # Auto-aim: enemy_radar is 8 sectors starting at +x going CCW
+            # (sector i covers angle = -i*pi/4 in screen coords).
+            er = state.get("enemy_radar", [1.0] * 8)
+            if len(er) == 8:
+                mi = int(min(range(8), key=lambda i: er[i]))
+                if er[mi] < 0.9:
+                    ang = -mi * (np.pi / 4.0)
+                    direction = (float(np.cos(ang)), float(np.sin(ang)))
+        elif last_act == 17 and state is not None:
+            gr = state.get("gold_radar", [1.0] * 8)
+            if len(gr) == 8:
+                mi = int(min(range(8), key=lambda i: gr[i]))
+                if gr[mi] < 0.9:
+                    ang = -mi * (np.pi / 4.0)
+                    direction = (float(np.cos(ang)), float(np.sin(ang)))
+
+        if direction is None:
+            return arr
+
+        dx, dy = direction
+        cx = cy = size // 2
+        radius = size // 2 - 2
+        ex = int(round(cx + dx * radius))
+        ey = int(round(cy + dy * radius))
+        cv2.line(arr, (cx, cy), (ex, ey), 255, thickness=2)
+        cv2.circle(arr, (cx, cy), 3, 200, -1)
+        return arr
+
+    def _push_frame(self, state: Optional[dict]) -> np.ndarray:
+        """Capture a new frame, push onto the stack, append the synthetic aim
+        channel, return stacked (frame_stack+1, H, W) uint8."""
+        frame = self._grab_frame(state)
+        if not self._frame_buf:
+            # Cold start: fill stack with the same frame so CNN sees no
+            # temporal noise on episode boundary.
+            for _ in range(self.frame_stack):
+                self._frame_buf.append(frame)
+        else:
+            self._frame_buf.append(frame)
+        aim = self._aim_channel(state)
+        stacked = np.stack(list(self._frame_buf) + [aim], axis=0)
+        return stacked  # (frame_stack+1, H, W)
+
+    def _make_obs(self, state: Optional[dict]) -> Any:
+        """Build the final observation (Dict if cv_enabled, else legacy Box(60,))."""
+        sensors = self._sensors_from_state(state)
+        if not self.cv_enabled:
+            return sensors
+        return {"image": self._push_frame(state), "sensors": sensors}
+
+    # Backwards-compat: old tests + callers expect a flat sensor vector here.
+    # The full Dict observation lives in _make_obs.
     def _obs_from_state(self, state: Optional[dict]) -> np.ndarray:
+        return self._sensors_from_state(state)
+
+    def _sensors_from_state(self, state: Optional[dict]) -> np.ndarray:
         # See module docstring for the full 60-feature layout.
         if state is None:
             return np.zeros(60, dtype=np.float32)
@@ -269,6 +518,7 @@ class NoitaEnv(gym.Env):
         self._hm_grace_steps          = 0
         self._fast_mv_counter         = 0
         self._long_survival_triggered = False
+        self._frame_buf.clear()        # CV: drop stale frames between episodes
 
         logger.debug("[env:{}] reset() — episode {}", self.port, self.episode_num)
 
@@ -287,7 +537,7 @@ class NoitaEnv(gym.Env):
             self.last_kills  = s.get("kills",  0)
             self.last_chests = s.get("chests", 0)
 
-        return self._obs_from_state(s), {}
+        return self._make_obs(s), {}
 
     def _wait_for_new_frame(self, prev_frame: int, timeout: float = 2.0) -> Optional[dict]:
         """Block until Noita sends a state with a different frame number."""
@@ -312,7 +562,7 @@ class NoitaEnv(gym.Env):
 
         if state is None:
             logger.debug("[env:{}] step() with no state (disconnected?)", self.port)
-            return self._obs_from_state(None), 0.0, False, False, {}
+            return self._make_obs(None), 0.0, False, False, {}
 
         current_x  = state.get("x",  0.0)
         current_y  = state.get("y",  0.0)
@@ -444,19 +694,29 @@ class NoitaEnv(gym.Env):
             r_chests = (current_chests - self.last_chests) * 3.0
         self.last_chests = current_chests
 
-        # 5b. Aim-on-enemy bonus: tiny reward when wand FIRED AND enemy in 250 px.
+        # 5b. Aim-on-enemy bonus: small reward when wand FIRED AND enemy in 250 px.
         # Fire actions: 8=fire_R … 16=fire_auto_enemy (excludes 17=fire_smart_loot).
-        # Kept at 0.01 so it can't be farmed — chunk/depth rewards dominate.
-        r_fire = 0.0
+        # Bumped 0.01 → 0.03 so it survives next to chunk (+0.5) / depth signals.
+        r_fire  = 0.0
+        # 5b-bis. Wasted-shot penalty: agent fired with no enemy in range OR
+        # while the wand was on cooldown. Discourages spam-firing into walls
+        # and the "stuck-in-fire-loop" failure mode.
+        r_waste = 0.0
         if int(action) in range(8, 17):   # 8..16 = all directional + auto-aim fire
             enemy_radar = state.get("enemy_radar", [1.0] * 8)
-            if any(v < 0.9 for v in enemy_radar):
-                r_fire = 0.01
+            wand_ready  = float(state.get("wand_ready", 1.0))
+            enemy_visible = any(v < 0.9 for v in enemy_radar)
+            if enemy_visible and wand_ready >= 0.5:
+                r_fire = 0.03
+            else:
+                # No legitimate reason to be pulling the trigger right now.
+                r_waste = -0.05
 
         # 5d. Terrain destruction bonus: wand fire visibly extended a ray = terrain broke.
         # Maps each directional fire action to the ray index it fires along.
-        # Only rewards when ray actually gets longer (indestructible walls: no change → no reward).
-        # Equal to chunk reward (0.5) so agent prefers opening new paths over standing still.
+        # Only rewards when ray actually got *meaningfully* longer (>45 px of
+        # the 150 px range, i.e. >0.30 normalised) — small flickers from sand
+        # falling no longer count.
         r_dig = 0.0
         _FIRE_TO_RAY = {8: 0, 9: 14, 10: 12, 11: 10, 12: 8, 13: 6, 14: 4, 15: 2}
         if (int(action) in _FIRE_TO_RAY and
@@ -464,8 +724,8 @@ class NoitaEnv(gym.Env):
             _ri = _FIRE_TO_RAY[int(action)]
             _pr = prev_state.get("rays", [])
             _cr = state.get("rays", [])
-            if len(_pr) > _ri and len(_cr) > _ri and _cr[_ri] - _pr[_ri] > 0.1:
-                r_dig = 0.5   # ray extended >15 px: terrain was destroyed
+            if len(_pr) > _ri and len(_cr) > _ri and _cr[_ri] - _pr[_ri] > 0.30:
+                r_dig = 0.5   # ray extended >45 px: terrain was destroyed
 
         # 5c. Portal proximity bonus + one-shot teleport reward (Holy Mountain).
         # During _post_portal_steps: suppress ALL proximity (entry portal right behind agent).
@@ -489,12 +749,14 @@ class NoitaEnv(gym.Env):
         if dead and current_hp <= 0:
             r_death = -1.0
 
-        reward = r_time + r_manh + r_depth + r_down_bias + r_chunk + r_dig + r_trunc + r_dmg + r_kills + r_chests + r_fire + r_portal + r_death
+        reward = (r_time + r_manh + r_depth + r_down_bias + r_chunk + r_dig
+                  + r_trunc + r_dmg + r_kills + r_chests + r_fire + r_waste
+                  + r_portal + r_death)
 
         # Accumulate per-episode reward totals (sent at episode end for /plot analysis)
         for _k, _v in (("time", r_time), ("manh", r_manh), ("depth", r_depth),
                        ("down", r_down_bias), ("chunk", r_chunk), ("dig", r_dig),
-                       ("fire", r_fire), ("portal", r_portal),
+                       ("fire", r_fire), ("waste", r_waste), ("portal", r_portal),
                        ("kills", r_kills), ("dmg", r_dmg), ("death", r_death), ("trunc", r_trunc)):
             self._ep_breakdown[_k] = self._ep_breakdown.get(_k, 0.0) + _v
 
@@ -502,10 +764,10 @@ class NoitaEnv(gym.Env):
         if self.episode_steps % 50 == 0:
             logger.debug(
                 "[env:{}] reward breakdown: time={:+.3f} manh={:+.3f} depth={:+.3f}"
-                " down={:+.3f} chunk={:+.2f} dig={:+.2f} fire={:+.2f} portal={:+.3f}"
-                " kills={:+.1f} dmg={:+.2f} death={:+.1f} total={:+.4f}",
+                " down={:+.3f} chunk={:+.2f} dig={:+.2f} fire={:+.2f} waste={:+.2f}"
+                " portal={:+.3f} kills={:+.1f} dmg={:+.2f} death={:+.1f} total={:+.4f}",
                 self.port, r_time, r_manh, r_depth, r_down_bias, r_chunk, r_dig,
-                r_fire, r_portal, r_kills, r_dmg, r_death, reward,
+                r_fire, r_waste, r_portal, r_kills, r_dmg, r_death, reward,
             )
 
         self.last_hp         = current_hp
@@ -632,9 +894,9 @@ class NoitaEnv(gym.Env):
             with self._lock:
                 self._state = None   # force reset() to wait for fresh state
             terminated = bool(dead) and not truncated
-            return self._obs_from_state(state), reward, terminated, truncated, info
+            return self._make_obs(state), reward, terminated, truncated, info
 
-        return self._obs_from_state(state), reward, False, False, {}
+        return self._make_obs(state), reward, False, False, {}
 
     def render(self) -> None:
         pass
@@ -642,3 +904,12 @@ class NoitaEnv(gym.Env):
     def close(self) -> None:
         with self._lock:
             self._ws = None
+        # Release the mss screen-grab handle (frees DC + GDI objects).
+        if self._sct is not None:
+            try:
+                self._sct.close()
+            except Exception:
+                pass
+            self._sct = None
+        self._hwnd = None
+        self._frame_buf.clear()

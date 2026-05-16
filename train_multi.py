@@ -116,8 +116,21 @@ def train(n_envs: int, base_port: int, total_steps: int, resume: str | None, fre
         except Exception:
             device = "auto"
         logger.info("PPO device: {}", device)
+
+        if cfg.cv_enabled:
+            policy_name = "MultiInputPolicy"
+            policy_kwargs = dict(
+                features_extractor_kwargs=dict(cnn_output_dim=256),
+                net_arch=dict(pi=[256, 128], vf=[256, 128]),
+            )
+            logger.info("Policy: MultiInputPolicy (CNN+MLP, {0}x{0} x{1})",
+                        cfg.image_size, cfg.frame_stack)
+        else:
+            policy_name = "MlpPolicy"
+            policy_kwargs = None
+
         model = PPO(
-            "MlpPolicy", env,
+            policy_name, env,
             verbose=1, learning_rate=cfg.learning_rate, n_steps=cfg.n_steps,
             batch_size=cfg.batch_size, n_epochs=cfg.n_epochs, gamma=cfg.gamma,
             gae_lambda=cfg.gae_lambda, clip_range=cfg.clip_range,
@@ -125,6 +138,7 @@ def train(n_envs: int, base_port: int, total_steps: int, resume: str | None, fre
             max_grad_norm=cfg.max_grad_norm,
             tensorboard_log=cfg.tensorboard_dir,
             device=device,
+            policy_kwargs=policy_kwargs,
         )
 
     logger.info("Training {}×{:,} steps, ~{:.1f}h per env",
