@@ -1,0 +1,31 @@
+# Auto detect text files
+* text=auto
+
+# Large files should use Git LFS
+*.dmp filter=lfs diff=lfs merge=lfs -text
+*.dll filter=lfs diff=lfs merge=lfs -text
+*.pt filter=lfs diff=lfs merge=lfs -text
+*.pth filter=lfs diff=lfs merge=lfs -text
+*.onnx filter=lfs diff=lfs merge=lfs -text
+*.bin filter=lfs diff=lfs merge=lfs -text
+
+# Explicitly declare text files
+*.md text
+*.txt text
+*.py text
+*.lua text
+*.yml text
+*.yaml text
+*.json text
+*.csv text
+*.html text
+*.css text
+*.js text
+
+# Binary files
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
