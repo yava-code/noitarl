@@ -205,3 +205,34 @@
 [12:40:17] [INFO ] DIAG ep=12 step=1128 pos=(29,402) vel=(0.0,60.0) vhp=4.00 gnd=false act=L chests=0 fps=55
 [12:40:23] [INFO ] DIAG ep=12 step=1203 pos=(35,381) vel=(0.0,-85.8) vhp=4.00 gnd=false act=UP chests=0 fps=59
 [12:40:28] [INFO ] DIAG ep=12 step=1278 pos=(39,394) vel=(0.0,166.8) vhp=4.00 gnd=false act=F_L chests=0 fps=58
+[12:40:36] [INFO ] DIAG ep=12 step=1353 pos=(37,361) vel=(51.0,-75.8) vhp=4.00 gnd=false act=UR chests=0 fps=44
+[12:40:42] [INFO ] DIAG ep=12 step=1428 pos=(63,359) vel=(0.0,144.8) vhp=4.00 gnd=false act=UP chests=0 fps=49
+[12:40:48] [INFO ] DIAG ep=12 step=1503 pos=(34,351) vel=(0.0,-99.8) vhp=4.00 gnd=false act=JETPK chests=0 fps=57
+[12:40:53] [INFO ] DIAG ep=12 step=1578 pos=(56,307) vel=(-51.0,60.2) vhp=4.00 gnd=false act=UL chests=0 fps=59
+[12:40:58] [INFO ] DIAG ep=12 step=1653 pos=(54,320) vel=(51.0,-43.2) vhp=4.00 gnd=false act=R chests=0 fps=50
+[12:41:05] [INFO ] DIAG ep=12 step=1728 pos=(66,389) vel=(-51.0,-132.5) vhp=4.00 gnd=false act=UL chests=0 fps=56
+[12:41:10] [INFO ] DIAG ep=12 step=1803 pos=(51,395) vel=(51.0,-144.2) vhp=4.00 gnd=false act=UR chests=0 fps=59
+[12:41:16] [INFO ] DIAG ep=12 step=1878 pos=(61,357) vel=(51.0,51.5) vhp=4.00 gnd=false act=R chests=0 fps=45
+[12:41:22] [INFO ] DIAG ep=12 step=1953 pos=(64,363) vel=(0.0,-87.2) vhp=4.00 gnd=false act=F_UL chests=0 fps=53
+[12:41:24] [INFO ] Force-respawn requested by Python (cowardice truncation)
+[12:41:24] [INFO ] Ep 12 ended  steps=1986  reason=DEAD  pos=(68,337)  vhp=0.000
+[12:41:24] [INFO ] Ep 13 started — spawn (208, 321) [pool=1]
+[12:41:28] [INFO ] DIAG ep=13 step=42 pos=(177,362) vel=(0.0,76.2) vhp=4.00 gnd=false act=F_UL chests=0 fps=56
+[12:41:33] [INFO ] DIAG ep=13 step=117 pos=(99,359) vel=(-51.0,-63.8) vhp=4.00 gnd=false act=UL chests=0 fps=53
+[12:41:39] [INFO ] DIAG ep=13 step=192 pos=(68,355) vel=(51.0,-63.8) vhp=4.00 gnd=false act=UR chests=0 fps=59
+[12:41:45] [INFO ] DIAG ep=13 step=267 pos=(42,353) vel=(0.0,28.2) vhp=4.00 gnd=false act=F_UR chests=0 fps=60
+[12:41:50] [INFO ] DIAG ep=13 step=342 pos=(59,352) vel=(0.0,63.2) vhp=4.00 gnd=false act=F_SMART chests=0 fps=60
+[12:41:55] [INFO ] DIAG ep=13 step=417 pos=(61,373) vel=(0.0,111.2) vhp=4.00 gnd=false act=F_AUTO chests=0 fps=60
+[12:42:00] [INFO ] DIAG ep=13 step=492 pos=(72,361) vel=(-51.0,227.0) vhp=4.00 gnd=false act=UL chests=0 fps=60
+[12:42:05] [INFO ] DIAG ep=13 step=567 pos=(78,305) vel=(0.0,-38.7) vhp=4.00 gnd=false act=F_SMART chests=0 fps=60
+[12:42:10] [INFO ] DIAG ep=13 step=642 pos=(70,334) vel=(51.0,-18.5) vhp=4.00 gnd=false act=UR chests=0 fps=60
+[12:42:15] [INFO ] DIAG ep=13 step=717 pos=(44,343) vel=(0.0,16.2) vhp=4.00 gnd=false act=F_U chests=0 fps=60
+[12:42:20] [INFO ] DIAG ep=13 step=792 pos=(47,375) vel=(0.0,-121.8) vhp=4.00 gnd=false act=JETPK chests=0 fps=60
+[12:42:26] [INFO ] DIAG ep=13 step=867 pos=(66,355) vel=(-51.0,-34.7) vhp=4.00 gnd=false act=UL chests=0 fps=60
+[12:42:31] [INFO ] DIAG ep=13 step=942 pos=(79,357) vel=(0.0,52.8) vhp=4.00 gnd=false act=F_SMART chests=0 fps=60
+[12:42:34] [INFO ] Force-respawn requested by Python (cowardice truncation)
+[12:42:34] [INFO ] Ep 13 ended  steps=980  reason=DEAD  pos=(62,374)  vhp=0.000
+[12:42:34] [INFO ] Ep 14 started — spawn (209, 321) [pool=1]
+[12:42:36] [INFO ] DIAG ep=14 step=37 pos=(168,397) vel=(0.0,55.9) vhp=4.00 gnd=true act=F_UL chests=0 fps=60
+[12:42:41] [INFO ] DIAG ep=14 step=112 pos=(94,393) vel=(-51.0,-144.2) vhp=4.00 gnd=false act=UL chests=0 fps=59
+[12:42:47] [INFO ] DIAG ep=14 step=187 pos=(83,381) vel=(0.0,-109.2) vhp=4.00 gnd=false act=F_AUTO chests=0 fps=59
