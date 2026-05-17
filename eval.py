@@ -27,20 +27,28 @@ console = Console()
 import torch
 
 def calculate_thinking(model, obs):
-    """Calculate action probabilities and saliency map for the current observation."""
+    """Return (wand_head_probs, saliency_per_obs_dim) for live HUD overlay.
+
+    Mirrors ThinkingCallback._calculate_thinking — see that docstring for
+    why we pick the wand head for visualisation under MultiDiscrete.
+    """
     obs_tensor = torch.as_tensor(obs).unsqueeze(0).to(model.device).requires_grad_(True)
-    
-    # Get distribution and probabilities
+
     distribution = model.policy.get_distribution(obs_tensor)
-    probs = distribution.distribution.probs[0].detach().cpu().numpy().tolist()
-    
-    # Calculate saliency (gradient of the selected action's logit w.r.t. observation)
-    logits = distribution.distribution.logits
+    inner = distribution.distribution
+    if isinstance(inner, (list, tuple)):
+        wand_dist = inner[-1]
+        probs  = wand_dist.probs[0].detach().cpu().numpy().tolist()
+        logits = wand_dist.logits
+    else:
+        probs  = inner.probs[0].detach().cpu().numpy().tolist()
+        logits = inner.logits
+
     action_idx = logits.argmax()
     logits[0, action_idx].backward()
-    
+
     saliency = obs_tensor.grad.abs().squeeze().cpu().numpy().tolist()
-    
+
     return probs, saliency
 
 def evaluate(model_path: str, n_episodes: int, port: int, step_delay: float) -> None:
@@ -80,7 +88,8 @@ def evaluate(model_path: str, n_episodes: int, port: int, step_delay: float) -> 
             env.set_extra({"probs": probs, "saliency": saliency})
 
             action, _ = model.predict(obs, deterministic=True)
-            obs, r, done, _, _ = env.step(int(action))
+            # MultiDiscrete: pass the action through as-is; env.step coerces to tuple.
+            obs, r, done, _, _ = env.step(action)
             total_r += r
             steps   += 1
             if step_delay > 0:

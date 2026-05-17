@@ -99,8 +99,61 @@ def find_latest_checkpoint(checkpoint_dir: str) -> str | None:
     return max(zips, key=os.path.getmtime) if zips else None
 
 
+def _load_bc_warmstart(model, bc_weights_path: str) -> None:
+    """Copy a BC-trained policy state_dict into a freshly-built PPO.
+
+    Loads every key whose shape matches the live policy, EXCEPT keys containing
+    ``value_net`` — BC didn't train those, and using its random/perturbed
+    value head as PPO's critic baseline tends to send the first few TD updates
+    in the wrong direction. The fresh PPO's value head stays untouched and
+    learns from TD bootstraps as normal.
+
+    The PPO optimizer is the one created during ``PPO.__init__`` — there is no
+    Adam state carried over from BC training, so the warm-start cannot
+    ""instantly collapse"" from stale moment estimates.
+    """
+    import torch
+    bc_state = torch.load(bc_weights_path, map_location=model.device)
+    own_state = model.policy.state_dict()
+
+    loaded, skipped_value, shape_mismatch, missing = 0, [], [], []
+    for k, v in bc_state.items():
+        if k not in own_state:
+            missing.append(k)
+            continue
+        if "value_net" in k:
+            skipped_value.append(k)
+            continue
+        if own_state[k].shape != v.shape:
+            shape_mismatch.append((k, tuple(v.shape), tuple(own_state[k].shape)))
+            continue
+        own_state[k] = v
+        loaded += 1
+
+    model.policy.load_state_dict(own_state)
+    logger.info(
+        "BC warm-start from {}: loaded {} keys, skipped {} value-head keys, "
+        "{} BC-only keys ignored, {} shape mismatches",
+        bc_weights_path, loaded, len(skipped_value), len(missing), len(shape_mismatch),
+    )
+    if shape_mismatch:
+        for k, src, dst in shape_mismatch[:5]:
+            logger.warning("  shape mismatch on {}: BC={} vs policy={}", k, src, dst)
+    if loaded == 0:
+        logger.error("BC warm-start loaded 0 keys — check that --bc-weights "
+                     "matches the same MultiInputPolicy/MlpPolicy as this run.")
+
+
 def train(args: argparse.Namespace) -> None:
     cfg = Config()
+    # --bc-weights implies a fresh PPO model (we're warm-starting the policy
+    # from a BC artefact, not resuming a prior PPO run). Anything else would
+    # silently shadow the BC weights with whatever auto-resume picked up.
+    if args.bc_weights and (args.resume or not args.fresh):
+        logger.info("--bc-weights set → forcing fresh PPO init (ignoring --resume / auto-resume).")
+        args.resume = None
+        args.fresh  = True
+
     if args.resume:
         cfg.resume_from = args.resume
     elif not args.fresh:
@@ -199,6 +252,15 @@ def train(args: argparse.Namespace) -> None:
             policy_kwargs    = policy_kwargs,
         )
 
+        # ── Optional BC warm-start ──────────────────────────────────────────
+        # PPO is fresh at this point: fresh optimiser (no stale Adam moments)
+        # and fresh value head. We copy in the BC-trained policy/feature-
+        # extractor weights but DELIBERATELY skip the value_net keys — BC has
+        # no value targets and loading its untrained value head would poison
+        # PPO's TD updates.
+        if args.bc_weights:
+            _load_bc_warmstart(model, args.bc_weights)
+
     # ── Callbacks ─────────────────────────────────────────────────────────────
     from callbacks import NoitaMonitorCallback, ThinkingCallback
     monitor_cb = NoitaMonitorCallback(cfg, notifier, verbose=0, recorder=recorder,
@@ -264,6 +326,10 @@ def parse_args() -> argparse.Namespace:
                    help="Ignore existing checkpoints and start a new run from scratch")
     p.add_argument("--name",   type=str, default=None, metavar="NAME",
                    help="Human-readable run name (also used in W&B / log file)")
+    p.add_argument("--bc-weights", type=str, default=None, metavar="PATH",
+                   help="Warm-start: load a BC-trained policy state_dict (.pth) into a "
+                        "fresh PPO before model.learn(). Skips value_net keys so the "
+                        "PPO critic stays randomly initialised. Implies --fresh.")
     return p.parse_args()
 
 

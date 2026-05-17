@@ -1,7 +1,7 @@
 """
 Gymnasium environment bridging Python ↔ Noita via WebSocket.
 
-Observation (60 float32, all in [0, 1]):
+Observation (60 float32, all in [0, 1]) — unchanged from prior version:
   [0..15]   16 platform rays       (0=wall, 1=150 px clear)
   [16..23]   8 enemy radar sectors  (1=none, 0=enemy at player)
   [24..31]   8 liquid sensors       (0=dry, ~1=pool ahead)
@@ -20,12 +20,19 @@ Observation (60 float32, all in [0, 1]):
   [58]       portal dx_norm    (0.5=portal at same X; <0.5 left, >0.5 right)
   [59]       portal dy_norm    (0.5=portal at same Y; <0.5 above, >0.5 below)
 
-Actions (Discrete 18):
-  0=idle  1=left  2=right  3=jump  4=left+jump  5=right+jump
-  6=jetpack_hold(ascend)  7=kick(melee)
-  8=fire_R  9=fire_UR  10=fire_U  11=fire_UL
-  12=fire_L  13=fire_DL  14=fire_D  15=fire_DR
-  16=fire_auto_enemy  17=fire_smart_loot
+Action space — MultiDiscrete([3, 2, 2, 2, 10]) (5 independent heads):
+  [0] move    : 0=Idle, 1=Left, 2=Right
+  [1] jump    : 0=Off, 1=On (only fires when on_ground)
+  [2] jetpack : 0=Off, 1=On (burns mFlyingTimeLeft for upward thrust)
+  [3] kick    : 0=Off, 1=On (15-frame cooldown, 30 px melee hemisphere)
+  [4] wand    : 0=Idle, 1=AutoAim_Enemy, 2..9 = R, UR, U, UL, L, DL, D, DR
+The five heads are independent — the policy can express "move right, jump,
+fire up" in one step. PPO sums per-head log-probs.
+
+Side-channel state from Lua (not part of the obs vector, used only for reward):
+  perfect_aim       — bool, true when wand-aim ray hits an enemy before a wall
+  rising_edge_fire  — bool, true on the frame fire transitioned false→true
+  last_kick_frame   — int game frame of the last successful kick
 """
 
 from __future__ import annotations
@@ -214,7 +221,8 @@ class NoitaEnv(gym.Env):
         self._sct: Optional[mss.base.MSSBase] = None  # mss instance per env (not thread-safe to share)
         self._frame_buf: deque = deque(maxlen=self.frame_stack)
 
-        self.action_space = gym.spaces.Discrete(18)
+        # MultiDiscrete: 5 independent heads. See module docstring for layout.
+        self.action_space = gym.spaces.MultiDiscrete([3, 2, 2, 2, 10])
         # +1 channel: synthetic aim overlay (drawn from last action).
         self._image_channels_total = self.frame_stack + 1
         if self.cv_enabled:
@@ -260,8 +268,11 @@ class NoitaEnv(gym.Env):
 
         self.route_x: list[float] = []
         self.route_y: list[float] = []
-        self.action_history: list[int] = []
+        # MultiDiscrete: each action is a 5-tuple of ints. Tuples (not lists) so
+        # they're hashable for Counter in action-loop truncation.
+        self.action_history: list[tuple[int, int, int, int, int]] = []
         self._ep_breakdown: dict = {}    # cumulative reward breakdown for current episode
+        self._last_kick_attr_count = 0   # tally of kills attributed to kick (logged only)
 
         # Post-portal grace periods (Holy Mountain navigation)
         self._post_portal_steps: int = 0  # suppress entry-portal proximity reward
@@ -343,17 +354,25 @@ class NoitaEnv(gym.Env):
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
-    def _send_action(self, action: int, extra: Optional[dict] = None) -> None:
+    def _send_action(self, action, extra: Optional[dict] = None) -> None:
+        """Serialise the MultiDiscrete action as a JSON list, or the legacy -1
+        truncation sentinel as a bare int.
+
+        action: either a 5-element sequence (np.ndarray/list/tuple) or the
+        literal int -1 (cowardice-truncation respawn request)."""
         with self._lock:
             ws   = self._ws
             loop = self._loop
         if ws is None or loop is None:
             return
         try:
-            payload = {"action": int(action)}
+            if isinstance(action, int) and action == -1:
+                payload: dict[str, Any] = {"action": -1}
+            else:
+                payload = {"action": [int(a) for a in action]}
             if extra:
                 payload.update(extra)
-            
+
             asyncio.run_coroutine_threadsafe(
                 ws.send(json.dumps(payload)), loop
             ).result(timeout=0.2)
@@ -454,45 +473,43 @@ class NoitaEnv(gym.Env):
             self._hwnd = None
             return blank
 
-    # Mapping fire action → unit aim vector (dx, dy) in screen coords (y-down).
+    # Mapping wand-head value → unit aim vector (dx, dy) in screen coords (y-down).
+    # Matches WAND_DIRS in init.lua exactly. Index 0 = idle (no aim), index 1 =
+    # auto-aim (direction inferred from enemy_radar at runtime), 2..9 = the
+    # eight cardinal/intercardinal directions.
     _FIRE_DIRS = {
-        8:  ( 1.0,  0.0),   # fire_R
-        9:  ( 0.7071, -0.7071),  # fire_UR
-        10: ( 0.0, -1.0),   # fire_U
-        11: (-0.7071, -0.7071),  # fire_UL
-        12: (-1.0,  0.0),   # fire_L
-        13: (-0.7071,  0.7071),  # fire_DL
-        14: ( 0.0,  1.0),   # fire_D
-        15: ( 0.7071,  0.7071),  # fire_DR
+        2: ( 1.0,  0.0),         # R
+        3: ( 0.7071, -0.7071),   # UR
+        4: ( 0.0, -1.0),         # U
+        5: (-0.7071, -0.7071),   # UL
+        6: (-1.0,  0.0),         # L
+        7: (-0.7071,  0.7071),   # DL
+        8: ( 0.0,  1.0),         # D
+        9: ( 0.7071,  0.7071),   # DR
     }
 
     def _aim_channel(self, state: Optional[dict]) -> np.ndarray:
         """Synthetic image channel: white line from centre toward the agent's
-        current aim direction. Empty for non-fire actions, which lets the CNN
+        current aim direction. Empty for wand=0 (no fire), which lets the CNN
         learn 'no line' = 'just moving / not shooting'."""
         size = self.image_size
         arr = np.zeros((size, size), dtype=np.uint8)
         if not self.action_history:
             return arr
-        last_act = int(self.action_history[-1])
+        last_action = self.action_history[-1]
+        # action_history holds 5-tuples of ints; component [4] is the wand head.
+        wand = int(last_action[4]) if isinstance(last_action, (tuple, list)) else 0
 
         direction: Optional[tuple[float, float]] = None
-        if last_act in self._FIRE_DIRS:
-            direction = self._FIRE_DIRS[last_act]
-        elif last_act == 16 and state is not None:
+        if wand in self._FIRE_DIRS:
+            direction = self._FIRE_DIRS[wand]
+        elif wand == 1 and state is not None:
             # Auto-aim: enemy_radar is 8 sectors starting at +x going CCW
             # (sector i covers angle = -i*pi/4 in screen coords).
             er = state.get("enemy_radar", [1.0] * 8)
             if len(er) == 8:
                 mi = int(min(range(8), key=lambda i: er[i]))
                 if er[mi] < 0.9:
-                    ang = -mi * (np.pi / 4.0)
-                    direction = (float(np.cos(ang)), float(np.sin(ang)))
-        elif last_act == 17 and state is not None:
-            gr = state.get("gold_radar", [1.0] * 8)
-            if len(gr) == 8:
-                mi = int(min(range(8), key=lambda i: gr[i]))
-                if gr[mi] < 0.9:
                     ang = -mi * (np.pi / 4.0)
                     direction = (float(np.cos(ang)), float(np.sin(ang)))
 
@@ -593,6 +610,7 @@ class NoitaEnv(gym.Env):
         self.route_x                  = []
         self.route_y                  = []
         self.action_history           = []
+        self._last_kick_attr_count    = 0
         self._ep_breakdown            = {}
         self._post_portal_steps       = 0
         self._hm_grace_steps          = 0
@@ -635,11 +653,17 @@ class NoitaEnv(gym.Env):
         _dismiss_error_dialog(self.noita_pid)
         return self._get_state()
 
-    def step(self, action: int):
+    def step(self, action):
+        # MultiDiscrete: SB3 hands us a numpy int array shape (5,). Convert once
+        # to a tuple of ints so downstream code can index/hash uniformly.
+        action_t: tuple[int, int, int, int, int] = (
+            int(action[0]), int(action[1]), int(action[2]),
+            int(action[3]), int(action[4]),
+        )
         prev_state = self._get_state()
         prev_frame = prev_state.get("frame", -1) if prev_state else -1
 
-        self._send_action(int(action), extra=self._extra_to_send)
+        self._send_action(action_t, extra=self._extra_to_send)
         self._extra_to_send = None
 
         # Wait for a genuinely new game frame, not stale data
@@ -767,10 +791,25 @@ class NoitaEnv(gym.Env):
 
         self.max_x = max(self.max_x, current_x)
 
+        # Kill reward + kick-nerf attribution.
+        # Wand kills: full +5.0 per kill (standard).
+        # Kick kills: nerfed to +1.0 to push the policy toward wand combat.
+        # A kill is attributed to kick if EITHER the kick bit is set this step
+        # OR the most recent kick was within 15 game frames (~3-4 agent steps
+        # at FRAME_SKIP=4) — matches init.lua's KICK_COOLDOWN window.
         r_kills = 0.0
         current_kills = state.get("kills", 0)
         if current_kills > self.last_kills:
-            r_kills = (current_kills - self.last_kills) * 5.0
+            delta = current_kills - self.last_kills
+            kick_now    = bool(action_t[3])
+            last_kick_f = int(state.get("last_kick_frame", -1_000_000))
+            cur_frame   = int(state.get("frame", 0))
+            kick_recent = (cur_frame - last_kick_f) <= 15
+            if kick_now or kick_recent:
+                r_kills = delta * 1.0
+                self._last_kick_attr_count += delta
+            else:
+                r_kills = delta * 5.0
         self.last_kills = current_kills
 
         r_chests = 0.0
@@ -779,34 +818,46 @@ class NoitaEnv(gym.Env):
             r_chests = (current_chests - self.last_chests) * 3.0
         self.last_chests = current_chests
 
-        # 5b. Aim-on-enemy bonus: small reward when wand FIRED AND enemy in 250 px.
-        # Fire actions: 8=fire_R … 16=fire_auto_enemy (excludes 17=fire_smart_loot).
-        # Bumped 0.01 → 0.03 so it survives next to chunk (+0.5) / depth signals.
-        r_fire  = 0.0
-        # 5b-bis. Wasted-shot penalty: agent fired with no enemy in range OR
-        # while the wand was on cooldown. Discourages spam-firing into walls
-        # and the "stuck-in-fire-loop" failure mode.
-        r_waste = 0.0
-        if int(action) in range(8, 17):   # 8..16 = all directional + auto-aim fire
-            enemy_radar = state.get("enemy_radar", [1.0] * 8)
-            wand_ready  = float(state.get("wand_ready", 1.0))
-            enemy_visible = any(v < 0.9 for v in enemy_radar)
-            if enemy_visible and wand_ready >= 0.5:
-                r_fire = 0.03
-            else:
-                # No legitimate reason to be pulling the trigger right now.
-                r_waste = -0.05
+        # 5b. Perfect-aim hitscan reward (rising edge only).
+        # init.lua casts the aim ray and sets state.perfect_aim=true when an
+        # enemy sits between the player and the first wall along the wand's
+        # current aim direction. We credit +1.0 once per shot launched
+        # (rising_edge_fire) so the agent can't farm by holding the trigger.
+        #
+        # 5b-bis. Wasted-shot penalty: fire with no enemy visible OR wand on
+        # cooldown. Discourages spam-firing into walls. Relaxed from -0.05 →
+        # -0.02 so it doesn't dominate while the wand head is still exploring.
+        # Drops r_fire (the coarse "any-fire+any-enemy" bonus) entirely —
+        # r_perfect is a strictly better signal.
+        wand_choice  = action_t[4]
+        wand_ready   = float(state.get("wand_ready", 1.0))
+        r_perfect = 0.0
+        if (wand_choice > 0
+                and state.get("perfect_aim", False)
+                and state.get("rising_edge_fire", False)
+                and wand_ready >= 0.5):
+            r_perfect = 1.0
 
-        # 5d. Terrain destruction bonus: wand fire visibly extended a ray = terrain broke.
-        # Maps each directional fire action to the ray index it fires along.
+        r_waste = 0.0
+        if wand_choice > 0:
+            enemy_radar   = state.get("enemy_radar", [1.0] * 8)
+            enemy_visible = any(v < 0.9 for v in enemy_radar)
+            if (not enemy_visible) or wand_ready < 0.5:
+                r_waste = -0.02
+
+        # 5d. Terrain destruction bonus: wand fire visibly extended a ray =
+        # terrain broke. Keyed on the wand head (2..9 = 8 fixed directions);
+        # auto-aim (wand==1) skipped because we don't know which ray to check.
         # Only rewards when ray actually got *meaningfully* longer (>45 px of
         # the 150 px range, i.e. >0.30 normalised) — small flickers from sand
         # falling no longer count.
         r_dig = 0.0
-        _FIRE_TO_RAY = {8: 0, 9: 14, 10: 12, 11: 10, 12: 8, 13: 6, 14: 4, 15: 2}
-        if (int(action) in _FIRE_TO_RAY and
+        # wand 2=R → ray 0, 3=UR → 14, 4=U → 12, 5=UL → 10,
+        # 6=L → 8, 7=DL → 6, 8=D → 4, 9=DR → 2
+        _FIRE_TO_RAY = {2: 0, 3: 14, 4: 12, 5: 10, 6: 8, 7: 6, 8: 4, 9: 2}
+        if (wand_choice in _FIRE_TO_RAY and
                 prev_state is not None and not prev_state.get("dead", False)):
-            _ri = _FIRE_TO_RAY[int(action)]
+            _ri = _FIRE_TO_RAY[wand_choice]
             _pr = prev_state.get("rays", [])
             _cr = state.get("rays", [])
             if len(_pr) > _ri and len(_cr) > _ri and _cr[_ri] - _pr[_ri] > 0.30:
@@ -874,13 +925,13 @@ class NoitaEnv(gym.Env):
         self.last_orbs = current_orbs
 
         reward = (r_time + r_manh + r_depth + r_down_bias + r_chunk + r_dig
-                  + r_trunc + r_dmg + r_kills + r_chests + r_fire + r_waste
+                  + r_trunc + r_dmg + r_kills + r_chests + r_perfect + r_waste
                   + r_portal + r_death + r_biome + r_orbs)
 
         # Accumulate per-episode reward totals (sent at episode end for /plot analysis)
         for _k, _v in (("time", r_time), ("manh", r_manh), ("depth", r_depth),
                        ("down", r_down_bias), ("chunk", r_chunk), ("dig", r_dig),
-                       ("fire", r_fire), ("waste", r_waste), ("portal", r_portal),
+                       ("perfect", r_perfect), ("waste", r_waste), ("portal", r_portal),
                        ("kills", r_kills), ("dmg", r_dmg), ("death", r_death),
                        ("trunc", r_trunc), ("biome", r_biome), ("orbs", r_orbs)):
             self._ep_breakdown[_k] = self._ep_breakdown.get(_k, 0.0) + _v
@@ -889,10 +940,10 @@ class NoitaEnv(gym.Env):
         if self.episode_steps % 50 == 0:
             logger.debug(
                 "[env:{}] reward breakdown: time={:+.3f} manh={:+.3f} depth={:+.3f}"
-                " down={:+.3f} chunk={:+.2f} dig={:+.2f} fire={:+.2f} waste={:+.2f}"
+                " down={:+.3f} chunk={:+.2f} dig={:+.2f} perfect={:+.2f} waste={:+.2f}"
                 " portal={:+.3f} kills={:+.1f} dmg={:+.2f} death={:+.1f} total={:+.4f}",
                 self.port, r_time, r_manh, r_depth, r_down_bias, r_chunk, r_dig,
-                r_fire, r_waste, r_portal, r_kills, r_dmg, r_death, reward,
+                r_perfect, r_waste, r_portal, r_kills, r_dmg, r_death, reward,
             )
 
         self.last_hp         = current_hp
@@ -901,7 +952,7 @@ class NoitaEnv(gym.Env):
 
         self.route_x.append(current_x)
         self.route_y.append(current_y)
-        self.action_history.append(int(action))
+        self.action_history.append(action_t)
 
         # ── Per-step VideoRecorder triggers ──────────────────────────────────
         if self._recorder is not None:
@@ -945,8 +996,11 @@ class NoitaEnv(gym.Env):
             else:
                 self._fast_mv_counter = 0
 
-            # 6. Wand kill in this step (fire actions 8-17, not KICK/JETPACK)
-            if current_kills > self.last_kills and int(action) in range(8, 18):
+            # 6. Wand kill in this step (wand head non-zero, attributed to wand
+            # rather than kick by the kick-recent window above).
+            if (current_kills > self.last_kills
+                    and action_t[4] > 0
+                    and not bool(action_t[3])):
                 rec.trigger_event("wand_kill", {**ctx_base, "kills": current_kills})
 
             # 7. Long survival milestone — fires DURING the episode (at step 600)
@@ -965,14 +1019,14 @@ class NoitaEnv(gym.Env):
             if max(wx) - min(wx) < 20 and max(wy) - min(wy) < 20:
                 visually_stuck = True
 
-        # Only IDLE (0) counts as a loop: standing still doing nothing.
-        # Movement (1-5), JETPACK (6), KICK (7), and fire (8-17) are all
-        # legitimate actions that should not trigger truncation.
-        _FARMABLE = {0}
+        # Only pure IDLE counts as a loop in MultiDiscrete: every head off.
+        # Any non-zero head (movement, jump, jetpack, kick, wand) is
+        # legitimate intent and should not trigger truncation.
+        _FARMABLE = {(0, 0, 0, 0, 0)}
         if len(self.action_history) >= 500:
             wa = self.action_history[-500:]
             top_action, top_count = Counter(wa).most_common(1)[0]
-            if top_count > 400 and top_action in _FARMABLE:  # 80% IDLE
+            if top_count > 400 and top_action in _FARMABLE:  # 80% pure-idle
                 action_loop = True
 
         # Action-loop truncation: degenerate policy (e.g. fire/idle farming).
@@ -981,7 +1035,7 @@ class NoitaEnv(gym.Env):
             truncated = True
             self._send_action(-1)
             logger.info(
-                "[env:{}] Truncated — action loop (action {} >80%% of 500 steps, -3 penalty).",
+                "[env:{}] Truncated — action loop (action {!r} >80%% of 500 steps, -3 penalty).",
                 self.port, self.action_history[-1],
             )
 
@@ -1016,7 +1070,10 @@ class NoitaEnv(gym.Env):
                 "noita/orbs_collected":         int(self.last_orbs),
                 "noita/biomes_reached":         len(self._biomes_reached),
                 "noita/deepest_biome_idx":      max(self._biomes_reached, default=0),
+                "noita/kick_attributed_kills":  int(self._last_kick_attr_count),
                 "noita/reward_breakdown": dict(self._ep_breakdown),  # cumulative episode totals
+                # MultiDiscrete: list of 5-tuples. Telemetry consumers must
+                # handle the tuple shape (was list[int] in the Discrete-18 era).
                 "noita/action_history": self.action_history,
             }
             with self._lock:

@@ -60,21 +60,40 @@ class ThinkingCallback(BaseCallback):
         return True
 
     def _calculate_thinking(self, obs):
+        """Return (wand_probs[10], saliency_per_obs_dim) for the live HUD.
+
+        MultiDiscrete note: SB3's `MultiCategoricalDistribution.distribution`
+        is a *list* of `torch.distributions.Categorical`, one per head. We
+        visualise the wand head (index 4, 10 options) since it's the most
+        policy-interesting and matches the Lua draw_probs layout. Saliency is
+        computed against the most-likely wand logit so the white-highlight
+        ray on the radar reflects what the wand decision actually cares about.
+
+        Falls back gracefully to Discrete (single Categorical) if the policy
+        happens to be loaded from an older checkpoint during a smoke test.
+        """
         model = self.model
         obs_tensor = torch.as_tensor(obs).unsqueeze(0).to(model.device).requires_grad_(True)
-        
+
         with torch.set_grad_enabled(True):
-            # Get distribution and probabilities
             distribution = model.policy.get_distribution(obs_tensor)
-            probs = distribution.distribution.probs[0].detach().cpu().numpy().tolist()
-            
-            # Calculate saliency (gradient of the selected action's logit w.r.t. observation)
-            logits = distribution.distribution.logits
-            action_idx = logits.argmax()
-            logits[0, action_idx].backward()
-            
+            inner = distribution.distribution  # tensor (Discrete) or list (MultiDiscrete)
+
+            if isinstance(inner, (list, tuple)):
+                # MultiDiscrete: pick the wand head (last in our 5-head layout).
+                wand_dist = inner[-1]
+                probs  = wand_dist.probs[0].detach().cpu().numpy().tolist()
+                logits = wand_dist.logits
+                action_idx = logits.argmax()
+                logits[0, action_idx].backward()
+            else:
+                probs  = inner.probs[0].detach().cpu().numpy().tolist()
+                logits = inner.logits
+                action_idx = logits.argmax()
+                logits[0, action_idx].backward()
+
             saliency = obs_tensor.grad.abs().squeeze().cpu().numpy().tolist()
-        
+
         return probs, saliency
 
 # optional wandb
@@ -209,12 +228,22 @@ class NoitaMonitorCallback(BaseCallback):
                     else:
                         obs_out = new_obs[i].tolist() if hasattr(new_obs[i], "tolist") else list(new_obs[i])
 
+                    # MultiDiscrete: actions[i] is a numpy int array shape (5,).
+                    # Serialise the whole vector instead of a single int.
+                    _a = actions[i]
+                    if hasattr(_a, "tolist"):
+                        action_out = [int(x) for x in _a.tolist()]
+                    else:
+                        try:
+                            action_out = [int(x) for x in _a]
+                        except TypeError:
+                            action_out = int(_a)
                     self._tel.log_step({
                         "episode":     self._total_episodes,
                         "global_step": self.num_timesteps,
                         "env_idx":     i,
                         "obs":         obs_out,
-                        "action":      int(actions[i]),
+                        "action":      action_out,
                         "reward":      float(rewards[i]),
                         "done":        bool(dones[i]) if dones is not None else False,
                     })
@@ -608,15 +637,26 @@ class NoitaMonitorCallback(BaseCallback):
             rb = self._last_reward_breakdown
             rb_str = "\n".join([f"  {k}: {v:+.3f}" for k, v in rb.items()]) if rb else "No data"
             
-            # 3. Gather action history
-            _ACTION_NAMES = {0:"IDLE",1:"LEFT",2:"RIGHT",3:"JUMP",4:"L+JMP",
-                             5:"R+JMP",6:"FIRE",7:"DIG↓",8:"KICK",9:"JETPACK"}
+            # 3. Gather action distribution from the wand head of the
+            # MultiDiscrete action. action_history is now a list of 5-tuples;
+            # the wand component ([4]) is the most policy-interesting head.
+            _WAND_NAMES = {0:"IDLE", 1:"AUTO", 2:"R", 3:"UR", 4:"U", 5:"UL",
+                           6:"L", 7:"DL", 8:"D", 9:"DR"}
             ah = self._last_action_history[-100:] if self._last_action_history else []
             from collections import Counter
-            counts = Counter(ah)
-            total_ah = len(ah) or 1
+            # Be permissive: legacy entries might still be ints from an old
+            # checkpoint reading the same telemetry hook.
+            wand_history = []
+            for a in ah:
+                if isinstance(a, (tuple, list)) and len(a) >= 5:
+                    wand_history.append(int(a[4]))
+                else:
+                    wand_history.append(int(a) if isinstance(a, int) else -1)
+            counts = Counter(wand_history)
+            total_ah = len(wand_history) or 1
             ah_str = ", ".join(
-                [f"{_ACTION_NAMES.get(k, k)}: {v * 100 // total_ah}%" for k, v in counts.most_common()]
+                [f"{_WAND_NAMES.get(k, k)}: {v * 100 // total_ah}%"
+                 for k, v in counts.most_common()]
             )
             
             # 4. Gather recent logs (last 10 lines)

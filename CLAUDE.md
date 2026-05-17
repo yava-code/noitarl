@@ -83,48 +83,63 @@ by `PlayerCollisionSystem`.
 | 58      | portal dx_norm     | 0.5 = same X; <0.5 portal is left, >0.5 portal is right |
 | 59      | portal dy_norm     | 0.5 = same Y; <0.5 portal is above, >0.5 portal is below |
 
-## Action space (Discrete 10)
+## Action space (MultiDiscrete `[3, 2, 2, 2, 10]`)
 
-Composable move+jump so the agent can hop over corridor ledges. Fire is a
-separate action; action 7 forces aim straight down ("dig"). KICK is a
-short-range melee that bypasses wand cooldown. JETPACK_HOLD burns fuel
-for sustained ascent.
+Five independent heads. PPO factorises log-probabilities head-by-head, so the
+policy can express *combinations* like "move right + jump + fire up + kick" in
+a single step. This replaced the prior `Discrete(18)` space, which forced a
+single choice per frame and trained the agent into a kick-only local optimum
+because moving and shooting were mutually exclusive.
 
-| Value | Effect |
-|-------|--------|
-| 0 | IDLE          — vx target = 0, no jump, no fire |
-| 1 | LEFT          — vx = −60 |
-| 2 | RIGHT         — vx = +60 |
-| 3 | JUMP          — vy = −150 (only when on_ground; no-op airborne) |
-| 4 | LEFT+JUMP     — vx = −60 AND jump (vertical part only triggers grounded) |
-| 5 | RIGHT+JUMP    — vx = +60 AND jump (vertical part only triggers grounded) |
-| 6 | FIRE          — auto-aim at nearest enemy, fire wand |
-| 7 | FIRE_DOWN     — aim straight down, fire wand (used for digging) |
-| 8 | KICK          — 0.5 melee damage in 30 px hemisphere ahead, 15-frame cooldown |
-| 9 | JETPACK_HOLD  — Δvy = −12/tick, burns mFlyingTimeLeft (no horizontal effect) |
+| Index | Head    | Values | Effect |
+|-------|---------|--------|--------|
+| 0     | move    | 0=Idle, 1=Left, 2=Right        | vx target (−60 / 0 / +60) |
+| 1     | jump    | 0=Off, 1=On                    | vy=−150 when grounded; no-op airborne |
+| 2     | jetpack | 0=Off, 1=On                    | Δvy=−12/tick, burns mFlyingTimeLeft |
+| 3     | kick    | 0=Off, 1=On                    | 0.5 melee damage in 30 px hemisphere, 15-frame cooldown |
+| 4     | wand    | 0=Idle, 1=AutoAim, 2..9=8 dirs | 0: no fire; 1: aim+fire at nearest enemy (250 px); 2..9: R, UR, U, UL, L, DL, D, DR |
 
 No smoothing: `mVelocity.x` is set to the target every action tick. This
 tightens credit assignment but means the agent can stop on a dime.
 
+**Aim writing is unconditional whenever wand ≥ 1.** A previous "camera-jitter
+fix" debounced aim writes; it accidentally froze the cursor entirely and is
+gone. The trade-off (more aggressive camera motion when the agent rapidly
+switches wand direction) is accepted to make the agent actually able to aim.
+
 ## Reward function
 
 ```
-−0.001                            time tax (small)
-+0.02 × Δmanhattan_from_spawn      when a new max distance from spawn is reached
-+0.5                               per newly visited 32×32 chunk (skipped if sky_visibility ≥ 0.3 — anti sky-farm)
-+0.02 × Δdepth_y                   small bonus for new depth record
-−1.0  × Δhp                        damage taken this step
-+5.0  × Δkills                     enemies killed
-+0.05                              FIRE/FIRE_DOWN pressed AND enemy in 250 px (aim-on-enemy bonus)
-+(0.3 − portal_dist) × 0.05        gradient pulling agent into portal (only when within 30% of PORTAL_RANGE)
-+20.0                              one-shot bonus on detected portal teleport (Δpos > 300 px AND was near portal last step)
-−1.0                               on death
-truncate after 600 steps without progress  (no penalty — just ends episode)
+−0.001                              time tax (small)
++0.015 × Δmanhattan_from_spawn       new max distance from spawn
++0.5                                 per newly visited 32×32 chunk (skipped if sky_visibility ≥ 0.3 — anti sky-farm)
++0.05  × Δdepth_y                    new depth record
++0.005 × Δy   (when moving down)     dense downward bias every step that moves deeper
++0.5                                 wand-fire visibly extended a ray ≥45 px (terrain destroyed)
++1.0                                 perfect_aim hitscan + rising-edge of fire + wand_ready (one shot launched at an enemy along an unobstructed line)
+−0.02                                wand fired with no enemy visible OR wand on cooldown (waste)
+−1.0 × Δhp                           damage taken this step
++5.0 × Δkills    (wand-attributed)   enemies killed via wand
++1.0 × Δkills    (kick-attributed)   enemies killed within 15 game frames of a kick — nerfed
++3.0                                 per chest opened
++(0.3 − portal_dist) × 0.05          pull toward Holy Mountain portal when within 30% of range
++20.0                                one-shot detected portal teleport (Δpos > 300 px AND was near portal last step)
++50 × biome_idx                      first time entering each new biome (coalmine=50, snowcave=100, …, the_work=300)
++100                                 per orb collected (proxy for boss defeat)
+−1.0                                 on death
+truncate −2 after 500 steps without descent
+truncate −3 after 80% pure-idle in 500 steps (action loop)
 ```
 
-The reward is built around Manhattan distance from the per-episode spawn,
-because the old "+Δdepth only" reward punished horizontal corridors. The
-−10 cowardice penalty has been removed entirely.
+**Kill attribution:** `init.lua` echoes `last_kick_frame` in the state JSON.
+Python compares `(state.frame − state.last_kick_frame) <= 15` to decide
+whether a kill in this step is wand- or kick-attributed.
+
+**Perfect aim:** `init.lua` raycasts the wand's aim direction with
+`RaytraceSurfacesAndLiquiform` for wall distance, then projects each enemy
+onto the ray; `perfect_aim=true` if any enemy sits before the wall within
+14 px perpendicular tolerance. The +1.0 reward is gated on rising-edge fire
++ `wand_ready` so the agent can't farm by holding the trigger.
 
 ---
 
@@ -195,12 +210,13 @@ python train_multi.py --envs 2 --resume checkpoints/noita_ppo_2env_400000_steps.
   the first platform below (`INITIAL_DESCENT_RANGE = 1500 px`,
   `INITIAL_DESCENT_LIFT = 20 px`). That post-descent position is what
   `spawn_candidates` records — every subsequent respawn lands underground.
-- **Jetpack is action 9 (JETPACK_HOLD).** Bare JUMP (3/4/5) still only fires
-  when grounded; airborne JUMP is a no-op. Action 9 adds Δvy = −12/tick and
-  burns `mFlyingTimeLeft` by 8/tick. The classic sky-farm exploit (fly up,
-  collect chunk reward, repeat) is blocked on the Python side by gating
-  `+0.5 chunk reward` on `sky_visibility < 0.3` — visiting open sky pays
-  nothing.
+- **Jetpack and jump are separate heads of the MultiDiscrete action.** The
+  jump head only takes effect while `on_ground` (airborne jump is a no-op).
+  The jetpack head adds Δvy = −12/tick and burns `mFlyingTimeLeft` by 8/tick;
+  it works in mid-air until fuel runs out. The classic sky-farm exploit
+  (fly up, collect chunk reward, repeat) is blocked on the Python side by
+  gating `+0.5 chunk reward` on `sky_visibility < 0.3` — visiting open sky
+  pays nothing.
 - **FRAME_SKIP = 4**. We process an action and send state every 4 frames (15 times 
   a second at 60 FPS). This is a trade-off: it reduces CPU overhead and network 
   latency while being fast enough for the agent to react to Noita's physics. 

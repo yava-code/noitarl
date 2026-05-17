@@ -31,7 +31,7 @@ local function err(m)   log("ERROR", m) end
 
 -- Clear log on each start so it doesn't grow forever
 do local f = io.open(LOG_FILE, "w"); if f then f:close() end end
-info("Mod init started — noitarl v0.4 (no jetpack, auto-descent into Mines)")
+info("Mod init started — noitarl v0.5 (MultiDiscrete action space, perfect-aim hitscan, force-aim every frame)")
 
 -- ── Safe component accessors ──────────────────────────────────────────────
 -- Noita's ComponentGetValue2 / ComponentSetValue2 silently crash if the
@@ -121,7 +121,10 @@ local FRAME_SKIP     = 4      -- Process action/state every 4 frames (trade-off:
 -- the agent is left on the surface it wanders aimlessly. We raycast
 -- straight down and land just above the first platform we hit.
 local INITIAL_DESCENT_RANGE  = 1500   -- max px below surface to search
-local INITIAL_DESCENT_LIFT   = 20     -- gap above the platform we land on
+local INITIAL_DESCENT_LIFT   = 40     -- gap above the platform we land on
+                                      -- (was 20; bumped because the player
+                                      -- collision box is taller than that
+                                      -- and was clipping into terrain)
 local initial_descent_done   = false
 
 -- Immortal-agent HP hack: engine never kills the player;
@@ -144,52 +147,49 @@ local hud_probs    = {}
 local hud_saliency = {}
 
 -- ── Per-frame state ───────────────────────────────────────────────────────
--- Discrete 18 action space:
---   0 IDLE | 1 L | 2 R | 3 UP | 4 UL | 5 UR
---   6 JETPK | 7 KICK
---   8 F_R | 9 F_UR | 10 F_U | 11 F_UL
---   12 F_L | 13 F_DL | 14 F_D | 15 F_DR
---   16 F_AUTO | 17 F_SMART
-local pending_action   = 0
-local last_action      = 0
+-- MultiDiscrete([3, 2, 2, 2, 10]) action space. Python sends a 5-element list:
+--   [1] move    : 0=Idle, 1=Left, 2=Right
+--   [2] jump    : 0/1
+--   [3] jetpack : 0/1
+--   [4] kick    : 0/1
+--   [5] wand    : 0=Idle, 1=AutoAim, 2..9 = 8 fixed dirs (R, UR, U, UL, L, DL, D, DR)
+-- The five heads are independent — agent can move, jump, kick AND fire same frame.
+local NOOP_ACTION = { move = 0, jump = false, jetpack = false, kick = false, wand = 0 }
+local pending_action   = { move = 0, jump = false, jetpack = false, kick = false, wand = 0 }
+local last_action      = { move = 0, jump = false, jetpack = false, kick = false, wand = 0 }
 local last_facing      = 1     -- last non-zero horizontal direction (for KICK aim)
-local last_kick_frame  = -1000
+local last_kick_frame  = -1000 -- echoed to Python so it can attribute kills to kick
 local agent_was_firing = false -- Track fire state locally so engine hardware poll doesn't break it
--- Camera-jitter fix: only rewrite ControlsComponent aim when it actually changes.
--- Noita's camera follows the aim cursor; rewriting it every action-frame caused
--- visible "convulsions" 3-5x/sec. Track last applied aim so we can skip no-op writes.
-local last_aim_type     = -1
-local last_aim_target_x = nil
-local last_aim_target_y = nil
-local ACTION_NAMES    = {
-    [0]="IDLE", [1]="L", [2]="R", [3]="UP", [4]="UL", [5]="UR",
-    [6]="JETPK", [7]="KICK",
-    [8]="F_R", [9]="F_UR", [10]="F_U", [11]="F_UL",
-    [12]="F_L", [13]="F_DL", [14]="F_D", [15]="F_DR",
-    [16]="F_AUTO", [17]="F_SMART"
+
+-- Perfect-aim hitscan flags carried between OnWorldPreUpdate (apply) and
+-- OnWorldPostUpdate (send-state). Cleared once sent.
+local perfect_aim_flag      = false   -- set when wand>0 and aim ray hits an enemy
+local rising_edge_fire_flag = false   -- set on the frame fire transitioned false→true
+
+-- Compact wand-direction unit vectors (matches Python _FIRE_DIRS layout).
+local WAND_DIRS = {
+    [2] = { 1.0,  0.0},   -- R
+    [3] = { 0.7071, -0.7071},  -- UR
+    [4] = { 0.0, -1.0},   -- U
+    [5] = {-0.7071, -0.7071},  -- UL
+    [6] = {-1.0,  0.0},   -- L
+    [7] = {-0.7071,  0.7071},  -- DL
+    [8] = { 0.0,  1.0},   -- D
+    [9] = { 0.7071,  0.7071},  -- DR
 }
--- {move_x, do_jump, do_fire, aim_type, aim_x, aim_y, do_kick, do_jetpack}
--- aim_type: 0=move_dir, 1=fixed_vec, 2=auto_enemy, 3=smart_loot
-local ACTION_DECODE = {
-    [0] = { 0, false, false, 0, 0, 0, false, false },
-    [1] = {-1, false, false, 0, 0, 0, false, false },
-    [2] = { 1, false, false, 0, 0, 0, false, false },
-    [3] = { 0, true,  false, 0, 0, 0, false, false },
-    [4] = {-1, true,  false, 0, 0, 0, false, false },
-    [5] = { 1, true,  false, 0, 0, 0, false, false },
-    [6] = { 0, false, false, 0, 0, 0, false, true  },
-    [7] = { 0, false, false, 0, 0, 0, true,  false },
-    [8] = { 0, false, true,  1,  1,  0, false, false }, -- Fire Right
-    [9] = { 0, false, true,  1,  1, -1, false, false }, -- Fire Up-Right
-    [10]= { 0, false, true,  1,  0, -1, false, false }, -- Fire Up
-    [11]= { 0, false, true,  1, -1, -1, false, false }, -- Fire Up-Left
-    [12]= { 0, false, true,  1, -1,  0, false, false }, -- Fire Left
-    [13]= { 0, false, true,  1, -1,  1, false, false }, -- Fire Down-Left
-    [14]= { 0, false, true,  1,  0,  1, false, false }, -- Fire Down
-    [15]= { 0, false, true,  1,  1,  1, false, false }, -- Fire Down-Right
-    [16]= { 0, false, true,  2,  0,  0, false, false }, -- Auto-aim enemy
-    [17]= { 0, false, true,  3,  0,  0, false, false }, -- Smart-aim loot
-}
+
+-- Short HUD label rendered from the 5-component action.
+local function action_label(a)
+    if not a then return "?" end
+    local m  = ({[0]="-", [1]="L", [2]="R"})[a.move] or "?"
+    local jp = a.jump    and "J" or "-"
+    local jt = a.jetpack and "T" or "-"
+    local kk = a.kick    and "K" or "-"
+    local w  = ({[0]="-", [1]="A", [2]="R", [3]="UR", [4]="U", [5]="UL",
+                 [6]="L", [7]="DL", [8]="D", [9]="DR"})[a.wand] or "?"
+    return string.format("%s%s%s%s w:%s", m, jp, jt, kk, w)
+end
+
 local MAX_EP_STEPS    = 5000  -- ~5.5 min at 60 fps with FRAME_SKIP=4; longer for biome-to-biome runs
 
 -- ── Episode tracking ──────────────────────────────────────────────────────
@@ -224,16 +224,57 @@ local function log_action_trace(rec)
     end
 end
 
+-- ── Perfect-aim hitscan ───────────────────────────────────────────────────
+-- Project each enemy onto the aim ray and check if it sits between the player
+-- and the first wall hit, within a ~14 px perpendicular tolerance. Bypasses
+-- projectile travel time so PPO can credit-assign aim in one step.
+local PERFECT_AIM_RANGE  = 300   -- px
+local PERFECT_AIM_HITBOX = 14    -- enemy half-width tolerance
+
+local function check_perfect_aim(player, px, py, aim_nx, aim_ny)
+    -- 1. Wall distance along the ray (RaytraceSurfacesAndLiquiform stops on
+    --    solid terrain and liquid surfaces — projectiles obey the same rules).
+    local far_x = px + aim_nx * PERFECT_AIM_RANGE
+    local far_y = py + aim_ny * PERFECT_AIM_RANGE
+    local rok, hit, hx, hy = pcall(RaytraceSurfacesAndLiquiform, px, py, far_x, far_y)
+    local d_wall = (rok and hit)
+        and math.sqrt((hx - px)^2 + (hy - py)^2)
+        or PERFECT_AIM_RANGE
+
+    -- 2. Project enemies onto the ray.
+    local eok, enemies = pcall(EntityGetInRadiusWithTag, px, py, PERFECT_AIM_RANGE, "enemy")
+    if not eok or not enemies then return false end
+    for _, eid in ipairs(enemies) do
+        if eid ~= player then
+            local tok, ex, ey = pcall(EntityGetTransform, eid)
+            if tok then
+                local dx, dy = ex - px, ey - py
+                local t = dx * aim_nx + dy * aim_ny      -- along-ray distance
+                if t > 0 and t < d_wall then
+                    local perp = math.abs(dx * aim_ny - dy * aim_nx)
+                    if perp < PERFECT_AIM_HITBOX then return true end
+                end
+            end
+        end
+    end
+    return false
+end
+
 -- ── Apply action: direct velocity injection, composable move+jump+fire ──
 -- No smoothing — grip is effectively 1.0 so the next physics tick sees the
 -- intended target velocity. This tightens credit assignment for PPO.
 local function apply_action(player, action)
     if not player or player == 0 then return end
+    action = action or NOOP_ACTION
     last_action = action
 
-    local decode = ACTION_DECODE[action] or ACTION_DECODE[0]
-    local move_x, do_jump, do_fire, aim_type, aim_x, aim_y, do_kick, do_jetpack =
-        decode[1], decode[2], decode[3], decode[4], decode[5], decode[6], decode[7], decode[8]
+    local move_v    = action.move or 0
+    local move_x    = (move_v == 1) and -1 or (move_v == 2) and 1 or 0
+    local do_jump   = action.jump    == true
+    local do_jetpack = action.jetpack == true
+    local do_kick   = action.kick    == true
+    local wand_v    = action.wand or 0
+    local do_fire   = wand_v > 0
 
     if move_x ~= 0 then last_facing = move_x end
 
@@ -288,18 +329,24 @@ local function apply_action(player, action)
         end
     end
 
-    -- Aiming + firing on ControlsComponent
+    -- Aiming + firing on ControlsComponent.
+    -- Aim semantics (MultiDiscrete wand head):
+    --   0  → no aim, no fire. Leave aim fields untouched (camera stays quiet).
+    --   1  → auto-aim at nearest enemy in 250 px, fire.
+    --   2..9 → fire in fixed 8-direction unit vector (see WAND_DIRS).
+    -- When wand > 0 we FORCE-WRITE the aim every action frame. The previous
+    -- debounce ("camera-jitter fix") was masking aim updates so aggressively
+    -- the cursor stayed frozen — superseded by responsiveness.
     local ctrl = EntityGetFirstComponent(player, "ControlsComponent")
     if ctrl then
         local tok, px, py = pcall(EntityGetTransform, player)
-        if tok then
-            local nx, ny = px + 50 * last_facing, py -- default: horizontal
-            
-            if aim_type == 1 then
-                -- Fixed vector (8 directions)
-                nx, ny = px + aim_x * 50, py + aim_y * 50
-            elseif aim_type == 2 then
-                -- Auto-aim: nearest enemy in 250 px
+        local perfect_this_frame = false
+        local rising_edge        = false
+        if tok and do_fire then
+            local nx, ny = px + 50 * last_facing, py
+            if wand_v == 1 then
+                -- Auto-aim: nearest enemy in 250 px (slight +4 vertical bias
+                -- for sprite centre).
                 local aok, enemies = pcall(EntityGetInRadiusWithTag, px, py, 250, "enemy")
                 if aok and enemies and #enemies > 0 then
                     local nearest_d2 = math.huge
@@ -313,83 +360,66 @@ local function apply_action(player, action)
                         end
                     end
                 end
-            elseif aim_type == 3 then
-                -- Smart-aim: nearest loot (chest or nugget)
-                local best_d2, bx, by = math.huge, nil, nil
-                local loot_tags = {"gold_nugget", "chest", "item_pickup"}
-                for _, tag in ipairs(loot_tags) do
-                    local lok, ents = pcall(EntityGetInRadiusWithTag, px, py, 200, tag)
-                    if lok and ents then
-                        for _, eid in ipairs(ents) do
-                            local eok, ex, ey = pcall(EntityGetTransform, eid)
-                            if eok then
-                                local d2 = (ex-px)^2 + (ey-py)^2
-                                if d2 < best_d2 then best_d2, bx, by = d2, ex, ey end
-                            end
-                        end
-                    end
-                end
-                if bx then nx, ny = bx, by end
+            else
+                local dir = WAND_DIRS[wand_v]
+                if dir then nx, ny = px + dir[1] * 50, py + dir[2] * 50 end
             end
 
             local dx, dy = nx - px, ny - py
-            local len = math.sqrt(dx*dx + dy*dy)
+            local len    = math.sqrt(dx*dx + dy*dy)
             if len > 0.001 then
-                local nxv, nyv = dx/len, dy/len
+                local nxv, nyv = dx / len, dy / len
 
-                -- Camera-jitter fix: only rewrite the aim cursor when the agent is
-                -- actually firing, the aim mode changed, or an enemy/loot target
-                -- moved far enough to matter. For pure-movement actions (aim_type==0)
-                -- we leave the cursor where the engine last had it.
-                local target_moved =
-                    last_aim_target_x and
-                    (math.abs(nx - last_aim_target_x) > 30
-                     or math.abs(ny - last_aim_target_y) > 30)
-                local should_update_aim =
-                    do_fire
-                    or aim_type ~= last_aim_type
-                    or (aim_type >= 2 and target_moved)
+                -- Force-write every frame the agent intends to aim. No debounce.
+                cset(ctrl, "mAimingVectorNormalized", nxv, nyv)
+                cset(ctrl, "mAimingVector",           nxv * 40, nyv * 40)
+                cset(ctrl, "mMousePosition",          nx, ny)
+                cset(ctrl, "mMousePositionRaw",       nx, ny)
+                cset(ctrl, "mGamePadCursorInWorld",   nx, ny)
+                cset(ctrl, "mGamepadIndirectAiming",  nxv, nyv)
+                -- mSmoothedAimingVector intentionally untouched (drives camera
+                -- glide; engine interpolation keeps it smooth).
 
-                if aim_type ~= 0 and should_update_aim then
-                    cset(ctrl, "mAimingVectorNormalized", nxv, nyv)
-                    cset(ctrl, "mAimingVector",           nxv * 40, nyv * 40)
-                    cset(ctrl, "mMousePosition",          nx, ny)
-                    cset(ctrl, "mMousePositionRaw",       nx, ny)
-                    cset(ctrl, "mGamePadCursorInWorld",   nx, ny)
-                    cset(ctrl, "mGamepadIndirectAiming",  nxv, nyv)
-                    -- Intentionally NOT touching mSmoothedAimingVector — leave
-                    -- engine interpolation alone so the camera glides instead of snapping.
-                    last_aim_type, last_aim_target_x, last_aim_target_y = aim_type, nx, ny
-                end
-
-                -- Facing always tracks intent so KICK / sprites stay correct, but
-                -- this single int doesn't move the camera.
+                -- Facing always tracks aim intent so KICK / sprites stay correct.
                 local cplat = EntityGetFirstComponent(player, "CharacterPlatformingComponent")
                 if cplat then cset(cplat, "mFacingDirection", (nxv >= 0) and 1 or -1) end
+
+                -- Perfect-aim raycast: does this aim ray hit an enemy before a wall?
+                perfect_this_frame = check_perfect_aim(player, px, py, nxv, nyv)
             end
         end
 
-        -- Fire: Fix "eternal first frame" bug by using local agent_was_firing
+        -- Fire button latch + rising-edge detection. agent_was_firing carries
+        -- the previous fire state; the transition false→true is the single
+        -- frame where a new shot actually launches.
         cset(ctrl, "mButtonDownFire",      do_fire)
         cset(ctrl, "mButtonDownLeftClick", do_fire)
         cset(ctrl, "mButtonDownAction",    do_fire)
-        
+
         if do_fire and not agent_was_firing then
             local frame = GameGetFrameNum()
             cset(ctrl, "mButtonFrameFire",      frame)
             cset(ctrl, "mButtonFrameLeftClick", frame)
             cset(ctrl, "mButtonFrameAction",    frame)
             agent_was_firing = true
+            rising_edge = true
         elseif not do_fire then
             agent_was_firing = false
         end
+
+        if perfect_this_frame then perfect_aim_flag = true end
+        if rising_edge        then rising_edge_fire_flag = true end
     end
 
     if cdata then
         log_action_trace({
-            f  = GameGetFrameNum(), a  = action,
+            f  = GameGetFrameNum(),
+            a  = { move_v, do_jump and 1 or 0, do_jetpack and 1 or 0,
+                   do_kick and 1 or 0, wand_v },
             mx = move_x, jp = do_jump and 1 or 0,
-            fr = do_fire and 1 or 0, at = aim_type,
+            fr = do_fire and 1 or 0, w = wand_v,
+            kk = do_kick and 1 or 0, jt = do_jetpack and 1 or 0,
+            pa = perfect_aim_flag and 1 or 0,
             vx = vx_out, vy = vy_out, gnd = on_ground_now and 1 or 0,
         })
     end
@@ -414,11 +444,16 @@ end
 local function respawn_player(player)
     virtual_hp = VIRTUAL_MAX_HP
 
-    -- Pick a spawn from the underground candidate pool (populated on first
-    -- descent). If the pool is somehow empty, redo the INITIAL_DESCENT_RANGE
-    -- raycast from the player's current position so we always land in the Mines.
+    -- Spawn priority:
+    --   1. spawn.txt override (with small ±SPAWN_JITTER on X) — for stable
+    --      hand-picked seeds where the auto-descent keeps clipping terrain.
+    --   2. spawn_candidates pool, populated by the first-frame descent.
+    --   3. Fresh descent raycast — only happens if (1) and (2) are unavailable.
     local sx, sy
-    if #spawn_candidates > 0 then
+    if SPAWN_OVERRIDE_X and SPAWN_OVERRIDE_Y then
+        local jx = math.random(-SPAWN_JITTER, SPAWN_JITTER)
+        sx, sy = SPAWN_OVERRIDE_X + jx, SPAWN_OVERRIDE_Y
+    elseif #spawn_candidates > 0 then
         sx, sy = pick_spawn()
     else
         local ok0, px, py = pcall(EntityGetTransform, player)
@@ -452,8 +487,11 @@ local function respawn_player(player)
 
     episode_num       = episode_num + 1
     episode_steps     = 0
-    pending_action    = 0
+    pending_action    = NOOP_ACTION
     chests_opened_ep  = 0
+    agent_was_firing  = false
+    perfect_aim_flag      = false
+    rising_edge_fire_flag = false
     info(string.format("Ep %d started — spawn (%.0f, %.0f) [pool=%d]",
         episode_num, sx, sy, #spawn_candidates))
 end
@@ -502,27 +540,33 @@ local function draw_radar(g, ox, oy, rays, saliency)
     GuiColorSetForNextWidget(g, 1, 1, 1, 1)
 end
 
+-- Draws the 10-element wand-head probability distribution. With MultiDiscrete
+-- the Python side sends the wand head as the most interesting visualisation
+-- (movement/jump/jetpack/kick are 2-3 element binaries that don't need bars).
+local WAND_LABELS = {
+    [1]="IDLE", [2]="AUTO", [3]="R", [4]="UR", [5]="U",
+    [6]="UL", [7]="L", [8]="DL", [9]="D", [10]="DR",
+}
 local function draw_probs(g, ox, oy, probs)
-    local bar_max_w = 40
-    for i = 0, 9 do
-        local p = probs[i+1] or 0.0
-        local name = ACTION_NAMES[i] or "?"
-        local ty = oy + i * 10
-        
+    for i = 1, 10 do
+        local p    = probs[i] or 0.0
+        local name = WAND_LABELS[i] or "?"
+        local ty   = oy + (i - 1) * 10
+
         -- Draw bar background
         GuiColorSetForNextWidget(g, 0.2, 0.2, 0.2, 1)
         GuiText(g, ox + 35, ty, "....................")
-        
+
         -- Draw bar
         local bar_len = math.floor(p * 20)
         if bar_len > 0 then
             GuiColorSetForNextWidget(g, 0.4, 0.8, 1, 1)
             GuiText(g, ox + 35, ty, string.rep("|", bar_len))
         end
-        
+
         -- Draw text
         GuiColorSetForNextWidget(g, 0.8, 0.8, 0.8, 1)
-        GuiText(g, ox, ty, string.format("%-5s %3d%%", name, math.floor(p*100)))
+        GuiText(g, ox, ty, string.format("%-5s %3d%%", name, math.floor(p * 100)))
     end
 end
 
@@ -783,10 +827,10 @@ function OnWorldPostUpdate()
         GuiColorSetForNextWidget(gui, 1, 0.4, 0.2, 1)
         GuiText(gui, 10, 10, string.format("RL AGENT  DISCONNECTED  retry:%d  fps:%.0f", retry, fps))
     else
-        local act = ACTION_NAMES[pending_action] or "?"
+        local act = action_label(pending_action)
         GuiColorSetForNextWidget(gui, 0.4, 1, 0.4, 1)
         GuiText(gui, 10, 10, string.format(
-            "RL AGENT  Ep:%-3d  Step:%-4d/%-4d  %-5s  fps:%.0f",
+            "RL AGENT  Ep:%-3d  Step:%-4d/%-4d  %-12s  fps:%.0f",
             episode_num, episode_steps, MAX_EP_STEPS, act, fps))
         -- Second HUD line: internal state for visual debugging (updated from last action frame)
         GuiColorSetForNextWidget(gui, 0.9, 0.9, 0.4, 1)
@@ -826,35 +870,42 @@ function OnWorldPostUpdate()
             if buf then emsg = ffi.string(buf) end
         end)
         warn(string.format("Socket error #%d — will reconnect", consecutive_errors))
-        socket = nil; pending_action = 0; return
+        socket = nil; pending_action = NOOP_ACTION; return
     end
 
     if st == "closed" then
         info("Socket closed — will reconnect")
-        socket = nil; pending_action = 0; return
+        socket = nil; pending_action = NOOP_ACTION; return
     end
 
     -- Buffer incoming action ───────────────────────────────────────────────
+    -- New payload format (MultiDiscrete):
+    --   { "action": [move(0..2), jump(0/1), jetpack(0/1), kick(0/1), wand(0..9)],
+    --     "probs":  [...],  "saliency": [...] }
+    -- Sentinel: action == -1 (number) still triggers a Python-side cowardice respawn.
     if msg and type(msg) == "string" and #msg > 0 then
         local ok2, data = pcall(json.decode, msg)
         if ok2 and type(data) == "table" then
             local act = data.action
-            if act == -1 then
+            if type(act) == "table" then
+                pending_action = {
+                    move    = math.floor(tonumber(act[1]) or 0),
+                    jump    = (tonumber(act[2]) or 0) ~= 0,
+                    jetpack = (tonumber(act[3]) or 0) ~= 0,
+                    kick    = (tonumber(act[4]) or 0) ~= 0,
+                    wand    = math.floor(tonumber(act[5]) or 0),
+                }
+            elseif type(act) == "number" and act == -1 then
                 info("Force-respawn requested by Python (cowardice truncation)")
                 virtual_hp = 0.0
-            elseif act then
-                pending_action = math.floor(act)
+            elseif act ~= nil then
+                warn("Unexpected action type: " .. type(act))
             end
-            hud_probs = data.probs or {}
+            hud_probs    = data.probs    or {}
             hud_saliency = data.saliency or {}
-        elseif ok2 and type(data) == "number" then
-            -- Backwards compatibility for raw action number
-            if data == -1 then
-                info("Force-respawn requested by Python (truncation)")
-                virtual_hp = 0.0
-            else
-                pending_action = math.floor(data)
-            end
+        elseif ok2 and type(data) == "number" and data == -1 then
+            info("Force-respawn requested by Python (truncation)")
+            virtual_hp = 0.0
         else
             warn("Bad action payload: " .. msg:sub(1, 40))
         end
@@ -877,24 +928,37 @@ function OnWorldPostUpdate()
     local cdata = EntityGetFirstComponent(player, "CharacterDataComponent")
 
     if not spawn_x then
-        -- First frame: drop the player from the surface into the Mines.
-        -- We skip the first SKIP_SURFACE_PX of terrain so we don't land on
-        -- the surface ledge — we want to be in the actual underground mines.
-        local SKIP_SURFACE_PX = 50  -- ignore surface terrain in first 50 px
-        local target_x, target_y = x, y + 400  -- fallback: guaranteed underground
+        local target_x, target_y
+        local SPAWN_OVERRIDE_X, SPAWN_OVERRIDE_Y = read_spawn_override()
+        if SPAWN_OVERRIDE_X and SPAWN_OVERRIDE_Y then
+            -- spawn.txt wins over auto-descent. Use coords exactly as given
+            -- (no descent raycast — the whole point of the override is to
+            -- pin a hand-verified safe spot for this world seed).
+            target_x, target_y = SPAWN_OVERRIDE_X, SPAWN_OVERRIDE_Y
+            info(string.format(
+                "Initial spawn (override) → (%.0f, %.0f)", target_x, target_y))
+        else
+            -- First frame: drop the player from the surface into the Mines.
+            -- Skip the first SKIP_SURFACE_PX of terrain so we don't land on
+            -- the surface ledge — we want the actual underground mines.
+            local SKIP_SURFACE_PX = 50
+            target_x, target_y = x, y + 400  -- fallback: guaranteed underground
 
-        -- Primary: find first platform below the surface layer.
-        local rok, hit, _hx, hy = pcall(
-            RaytracePlatforms, x, y + SKIP_SURFACE_PX, x, y + INITIAL_DESCENT_RANGE
-        )
-        if rok and hit then
-            target_y = hy - INITIAL_DESCENT_LIFT
-        end
+            local rok, hit, _hx, hy = pcall(
+                RaytracePlatforms, x, y + SKIP_SURFACE_PX, x, y + INITIAL_DESCENT_RANGE
+            )
+            if rok and hit then
+                target_y = hy - INITIAL_DESCENT_LIFT
+            end
 
-        -- Safety: if we ended up suspiciously close to the starting y,
-        -- the raycast hit surface terrain — push further down.
-        if math.abs(target_y - y) < 100 then
-            target_y = y + 400
+            -- Safety: if we ended up suspiciously close to the starting y,
+            -- the raycast hit surface terrain — push further down.
+            if math.abs(target_y - y) < 100 then
+                target_y = y + 400
+            end
+            info(string.format(
+                "Spawn recorded (%.0f, %.0f) — descended from surface (%.0f, %.0f)",
+                target_x, target_y, x, y))
         end
 
         pcall(EntitySetTransform, player, target_x, target_y)
@@ -904,9 +968,6 @@ function OnWorldPostUpdate()
         spawn_candidates[#spawn_candidates + 1] = { x = target_x, y = target_y }
         initial_descent_done = true
         episode_num = 1
-        info(string.format(
-            "Spawn recorded (%.0f, %.0f) — descended from surface (%.0f, %.0f)",
-            target_x, target_y, x, y))
 
         -- Reflect the teleport in this frame's state so observation is correct
         x, y = target_x, target_y
@@ -1009,7 +1070,7 @@ function OnWorldPostUpdate()
         info(string.format(
             "DIAG ep=%d step=%d pos=(%.0f,%.0f) vel=(%.1f,%.1f) vhp=%.2f gnd=%s act=%s chests=%d fps=%.0f",
             episode_num, episode_steps, x, y, vx, vy, virtual_hp,
-            tostring(on_ground), ACTION_NAMES[last_action] or "?",
+            tostring(on_ground), action_label(last_action),
             chests_opened_ep, fps))
     end
 
@@ -1027,10 +1088,14 @@ function OnWorldPostUpdate()
             is_on_fire=0.0, is_poisoned=0.0, sky_visibility=sky_visibility,
             gold=gold, kills=kills, chests=chests_opened_ep,
             biome=biome_name, orbs=orb_count,
-            dead=true, on_ground=false, frame=frame
+            dead=true, on_ground=false, frame=frame,
+            last_kick_frame = last_kick_frame,
+            perfect_aim = false, rising_edge_fire = false,
         }
         local ok4, encoded = pcall(json.encode, dead_state)
         if ok4 then pcall(socket.send, socket, encoded) end
+        perfect_aim_flag      = false
+        rising_edge_fire_flag = false
         respawn_player(player)
         return
     end
@@ -1045,6 +1110,16 @@ function OnWorldPostUpdate()
     if not cb_ok then cb_w, cb_h = 0, 0 end
 
     -- Send live state ──────────────────────────────────────────────────────
+    -- New fields (vs pre-MultiDiscrete):
+    --   last_kick_frame    — Python compares (frame - last_kick_frame) <= 15
+    --                        to attribute kills to a recent kick and nerf
+    --                        the reward from +5 → +1.
+    --   perfect_aim        — set true when this action frame's wand aim ray
+    --                        intersects an enemy before any wall.
+    --   rising_edge_fire   — set true on the frame fire transitioned
+    --                        false→true (one shot launched). Python gates
+    --                        +1.0 perfect-aim reward on this AND wand_ready,
+    --                        so the agent can't farm by holding the trigger.
     local state = {
         x=x, y=y, hp=hp_norm, vx=vx, vy=vy,
         rays=rays, liquid_sensors=liquid_sensors, enemy_radar=enemy_radar,
@@ -1057,7 +1132,13 @@ function OnWorldPostUpdate()
         biome=biome_name, orbs=orb_count,
         dead=false, on_ground=on_ground, frame=frame,
         cam_x=cam_x, cam_y=cam_y, cam_w=cb_w, cam_h=cb_h,
+        last_kick_frame  = last_kick_frame,
+        perfect_aim      = perfect_aim_flag,
+        rising_edge_fire = rising_edge_fire_flag,
     }
+    -- Clear single-frame flags after they've been packed into the state.
+    perfect_aim_flag      = false
+    rising_edge_fire_flag = false
     local ok5, encoded = pcall(json.encode, state)
     if ok5 then
         local ok6, send_err = pcall(socket.send, socket, encoded)
@@ -1066,7 +1147,7 @@ function OnWorldPostUpdate()
             consecutive_errors = consecutive_errors + 1
             if consecutive_errors >= MAX_ERRORS then
                 err("Too many send errors — resetting socket")
-                socket = nil; pending_action = 0
+                socket = nil; pending_action = NOOP_ACTION
             end
         else
             consecutive_errors = 0

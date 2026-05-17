@@ -258,20 +258,27 @@ class TelegramNotifier:
             ax2.text(0.5, 0.5, "No route data", ha='center', va='center')
         ax2.set_aspect('equal', 'datalim')
         
-        # 3. Action Distribution (Bottom Left)
+        # 3. Action Distribution (Bottom Left) — wand-head pie chart for
+        # MultiDiscrete([3,2,2,2,10]). The wand head is the policy's most
+        # interesting decision; the other heads collapse to 2-3 buckets and
+        # don't make for a useful pie.
         ax3 = axes[1, 0]
         if actions:
             from collections import Counter
-            # Map action IDs to names
-            ACTION_NAMES = {
-                0:"IDLE", 1:"LEFT", 2:"RIGHT", 3:"JUMP",
-                4:"L+JMP", 5:"R+JMP", 6:"FIRE", 7:"DIG↓",
-                8:"KICK", 9:"JETPACK",
+            WAND_NAMES = {
+                0:"IDLE", 1:"AUTO", 2:"R", 3:"UR", 4:"U", 5:"UL",
+                6:"L", 7:"DL", 8:"D", 9:"DR",
             }
-            counts = Counter(actions)
-            labels = [ACTION_NAMES.get(a, str(a)) for a in counts.keys()]
+            wand_actions = []
+            for a in actions:
+                if isinstance(a, (tuple, list)) and len(a) >= 5:
+                    wand_actions.append(int(a[4]))
+                elif isinstance(a, int):
+                    wand_actions.append(a)
+            counts = Counter(wand_actions)
+            labels = [WAND_NAMES.get(a, str(a)) for a in counts.keys()]
             ax3.pie(counts.values(), labels=labels, autopct='%1.1f%%', startangle=140)
-            ax3.set_title("Action Distribution (Last Ep)")
+            ax3.set_title("Wand-head Action Distribution (Last Ep)")
         else:
             ax3.text(0.5, 0.5, "No action data", ha='center', va='center')
             
