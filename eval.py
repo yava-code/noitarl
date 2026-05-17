@@ -8,7 +8,6 @@ Usage:
     python eval.py model.zip --slow 0.5   # run at 50% speed (sleep 50ms between steps)
 """
 
-from __future__ import annotations
 
 import argparse
 import sys

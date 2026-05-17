@@ -109,6 +109,12 @@ class TestFallbackDescriptions:
         assert isinstance(result, str)
         assert len(result) > 5
 
+
+    @pytest.mark.parametrize("event_name", ALL_EVENTS)
+    def test_trigger_does_not_crash_on_empty_ctx(self, recorder, event_name):
+        recorder.trigger_event(event_name, {})
+        assert not recorder._event_q.empty()
+
     @pytest.mark.parametrize("event_name", ALL_EVENTS)
     def test_fallback_does_not_crash_on_empty_ctx(self, recorder, event_name):
         result = recorder._groq_describe(event_name, {})
@@ -237,3 +243,35 @@ class TestStateMachine:
 
     def test_pre_buffer_starts_empty(self, recorder):
         assert len(recorder._pre_buf) == 0
+
+# ---------------------------------------------------------------------------
+# State Tests
+# ---------------------------------------------------------------------------
+
+class TestStateProperties:
+    def test_is_idle(self, recorder):
+        assert recorder.is_idle is True
+        recorder._state = "recording"
+        assert recorder.is_idle is False
+        recorder._state = "cooldown"
+        assert recorder.is_idle is False
+
+    def test_status(self, recorder):
+        assert recorder.status == "idle"
+        recorder._state = "recording"
+        assert recorder.status == "recording"
+        recorder._state = "cooldown"
+        assert recorder.status == "cooldown"
+
+    def test_force_trigger(self, recorder):
+        recorder._state = "cooldown" # Set to cooldown
+        assert recorder.is_idle is False
+
+        # force_trigger should bypass cooldown
+        recorder.force_trigger("force_event", {"info": "data"})
+
+        # It should place the event on the queue regardless of cooldown state
+        assert not recorder._event_q.empty()
+        item = recorder._event_q.get_nowait()
+        assert item["name"] == "force_event"
+        assert item["ctx"] == {"info": "data"}
