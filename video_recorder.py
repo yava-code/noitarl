@@ -1,3 +1,4 @@
+from collections import deque
 """
 VideoRecorder — event-triggered highlight recorder for NoitaRL.
 
@@ -29,7 +30,7 @@ Extreme events detected (15 types):
   wand_kill            — wand shot killed an enemy
 """
 
-from __future__ import annotations
+
 
 import collections
 import io
@@ -564,8 +565,8 @@ class VideoRecorder:
         log_path = os.path.join(os.path.dirname(__file__), "logger.txt")
         try:
             with open(log_path, "r", encoding="utf-8", errors="replace") as f:
-                lines = f.readlines()
-            return "".join(lines[-n_lines:]).strip()
+                lines = deque(f, maxlen=n_lines)
+            return "".join(lines).strip()
         except Exception:
             return ""
 
@@ -575,8 +576,8 @@ class VideoRecorder:
         trace_path = os.path.join(os.path.dirname(__file__), "actions_trace.jsonl")
         try:
             with open(trace_path, "r", encoding="utf-8", errors="replace") as f:
-                lines = f.readlines()
-            return "".join(lines[-n:]).strip()
+                lines = deque(f, maxlen=n)
+            return "".join(lines).strip()
         except Exception:
             return ""
 
