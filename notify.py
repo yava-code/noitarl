@@ -8,7 +8,6 @@ Features:
   • Graceful no-op   — if token / chat_id are empty, every method silently returns
 """
 
-from __future__ import annotations
 
 import io
 import threading
@@ -22,6 +21,18 @@ import requests
 from loguru import logger
 from PIL import Image, ImageDraw, ImageFont
 
+
+
+_cached_font = None
+def _get_font():
+    global _cached_font
+    if _cached_font is None:
+        try:
+            from PIL import ImageFont
+            _cached_font = ImageFont.truetype("arial.ttf", 24)
+        except IOError:
+            _cached_font = ImageFont.load_default()
+    return _cached_font
 
 class TelegramNotifier:
     def __init__(self, token: str, chat_id: str):
@@ -188,10 +199,7 @@ class TelegramNotifier:
         try:
             img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
             draw = ImageDraw.Draw(img)
-            try:
-                font = ImageFont.truetype("arial.ttf", 24)
-            except IOError:
-                font = ImageFont.load_default()
+            font = _get_font()
                 
             # Add a semi-transparent black rectangle at the bottom
             width, height = img.size
@@ -338,8 +346,7 @@ class TelegramNotifier:
         """fn() should return a formatted string of current training stats."""
         self._stats_fn = fn
 
-    @staticmethod
-    def _find_noita_hwnd() -> Optional[int]:
+    def _find_noita_hwnd(self) -> "int | None":
         """
         Return HWND of the Noita game window, matched by process executable
         (noita.exe / noita_dev.exe) so browser tabs with 'noita' in their title
@@ -351,6 +358,12 @@ class TelegramNotifier:
 
             k32    = ctypes.windll.kernel32
             user32 = ctypes.windll.user32
+
+            # Check if cached hwnd is still valid
+            if hasattr(self, '_cached_hwnd') and self._cached_hwnd is not None:
+                if user32.IsWindow(self._cached_hwnd):
+                    return self._cached_hwnd
+                self._cached_hwnd = None
             PROCESS_QUERY_LIMITED = 0x1000
 
             found: list = []
@@ -382,7 +395,10 @@ class TelegramNotifier:
                 return True
 
             user32.EnumWindows(_cb, 0)
-            return found[0] if found else None
+            if found:
+                self._cached_hwnd = found[0]
+                return found[0]
+            return None
         except Exception:
             return None
 
@@ -467,10 +483,7 @@ class TelegramNotifier:
 
             if overlay_text:
                 draw = ImageDraw.Draw(img)
-                try:
-                    font = ImageFont.truetype("arial.ttf", 24)
-                except IOError:
-                    font = ImageFont.load_default()
+                font = _get_font()
                 text_bbox = draw.textbbox((10, 10), overlay_text, font=font)
                 draw.rectangle(
                     [text_bbox[0]-5, text_bbox[1]-5, text_bbox[2]+5, text_bbox[3]+5],

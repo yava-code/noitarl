@@ -1,3 +1,4 @@
+from unittest.mock import patch
 """
 Tests for TelegramNotifier.
 
@@ -185,3 +186,22 @@ class TestCommandRegistration:
         noop.register_stats_provider(lambda: "stats text")
         assert noop._stats_fn is not None
         assert noop._stats_fn() == "stats text"
+
+# ---------------------------------------------------------------------------
+# AI Status
+# ---------------------------------------------------------------------------
+
+class TestAIStatus:
+    def test_empty_groq_key(self, noop):
+        result = noop.generate_ai_status(groq_key="", stats_context="Test stats")
+        assert result == "⚠️ Groq API key not set. Please set GROQ_API_KEY in .env."
+
+    def test_empty_groq_key_none(self, noop):
+        result = noop.generate_ai_status(groq_key=None, stats_context="Test stats")
+        assert result == "⚠️ Groq API key not set. Please set GROQ_API_KEY in .env."
+
+class TestSetupBotMenu:
+    def test_setup_bot_menu_error(self, fake):
+        with patch('requests.post', side_effect=Exception('Mock API Error')):
+            # Should not crash
+            fake.setup_bot_menu()

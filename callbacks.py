@@ -4,13 +4,11 @@ Custom Stable-Baselines3 callbacks for NoitaRL.
 NoitaMonitorCallback  — episode stats, Telegram alerts, W&B logging, Rich table
 """
 
-from __future__ import annotations
 
 import os
 import time
 import csv
 from collections import deque
-from typing import Optional
 
 import glob
 import numpy as np
