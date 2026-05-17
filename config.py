@@ -65,6 +65,16 @@ class Config(BaseSettings):
     # ── Groq (AI captions for video highlights) ───────────────────────────────
     groq_api_key: str = ""   # set GROQ_API_KEY env var or in .env file
 
+    # ── Azure Telemetry ───────────────────────────────────────────────────────
+    # Leave blank to disable telemetry (silent no-op).
+    azure_cosmos_url: str            = ""
+    azure_cosmos_key: str            = ""
+    azure_cosmos_db: str             = "noitarl"
+    azure_cosmos_container: str      = "episodes"
+    azure_blob_connection_string: str = ""
+    azure_blob_container_steps: str  = "noita-steps"
+    azure_blob_container_assets: str = "noita-assets"
+
     @property
     def telegram_enabled(self) -> bool:
         return bool(self.telegram_token and self.telegram_chat_id)

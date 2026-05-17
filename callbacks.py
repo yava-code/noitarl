@@ -22,6 +22,12 @@ from stable_baselines3.common.callbacks import BaseCallback
 from config import Config
 from notify import TelegramNotifier
 
+# Azure telemetry — imported lazily so missing SDK doesn't break startup
+try:
+    from azure_telemetry import AzureTelemetry as _AzureTelemetry
+except ImportError:
+    _AzureTelemetry = None
+
 console = Console()
 
 import torch
@@ -96,11 +102,13 @@ class NoitaMonitorCallback(BaseCallback):
         notifier: TelegramNotifier,
         verbose: int = 0,
         recorder=None,
+        telemetry=None,
     ):
         super().__init__(verbose)
         self._cfg       = cfg
         self._tg        = notifier
         self._recorder  = recorder    # VideoRecorder | None
+        self._tel       = telemetry   # AzureTelemetry | None
         self._start_ts  = time.time()
         self._last_tg   = 0          # steps at last telegram send
         self._muted     = False      # toggle periodic updates
@@ -188,6 +196,30 @@ class NoitaMonitorCallback(BaseCallback):
             time.sleep(1.0)
             if self._stop_requested:
                 return False
+
+        # ── Per-step Azure telemetry (non-blocking) ───────────────────────────
+        if self._tel is not None:
+            new_obs  = self.locals.get("new_obs")
+            actions  = self.locals.get("actions")
+            rewards  = self.locals.get("rewards")
+            dones    = self.locals.get("dones")
+            if new_obs is not None and actions is not None and rewards is not None:
+                n = len(actions)
+                for i in range(n):
+                    if isinstance(new_obs, dict):
+                        obs_out = {k: "IMAGE_DATA" if "image" in k else (v[i].tolist() if hasattr(v[i], "tolist") else list(v[i])) for k, v in new_obs.items()}
+                    else:
+                        obs_out = new_obs[i].tolist() if hasattr(new_obs[i], "tolist") else list(new_obs[i])
+
+                    self._tel.log_step({
+                        "episode":     self._total_episodes,
+                        "global_step": self.num_timesteps,
+                        "env_idx":     i,
+                        "obs":         obs_out,
+                        "action":      int(actions[i]),
+                        "reward":      float(rewards[i]),
+                        "done":        bool(dones[i]) if dones is not None else False,
+                    })
 
         infos = self.locals.get("infos", [])
         for info in infos:
@@ -286,8 +318,8 @@ class NoitaMonitorCallback(BaseCallback):
                     if depth > 500:   # only meaningful depth
                         rec.trigger_event("new_depth_record", ctx)
                 # Kill spree
-                if kills >= 3:
-                    rec.trigger_event("kill_spree", ctx)
+                # if kills >= 3:
+                #     rec.trigger_event("kill_spree", ctx)
                 # Death after long run — high threshold so routine deaths don't spam
                 if death_reason == "DEAD" and l >= 600:
                     rec.trigger_event("death_long_run", ctx)
@@ -308,6 +340,13 @@ class NoitaMonitorCallback(BaseCallback):
                 self._tg.send_text("⚠️ <b>Agent stuck!</b>\n5 consecutive timeouts without progress.")
                 self._consecutive_timeouts = 0
 
+            # ── Azure telemetry: flush episode steps + summary ────────────────
+            if self._tel is not None:
+                tel_info = dict(info)
+                tel_info["noita/episode"]     = self._total_episodes
+                tel_info["noita/global_step"] = self.num_timesteps
+                self._tel.flush_episode(tel_info)
+
             # Log every episode to loguru
             logger.debug(
                 "ep={} reward={:.2f} length={} chunks={} dist={:.0f} depth={:.0f} kills={} reason={} steps={}",
@@ -322,6 +361,9 @@ class NoitaMonitorCallback(BaseCallback):
             self.logger.record("noita/kills",              kills)
             self.logger.record("noita/chests_opened",      chests_opened)
             self.logger.record("noita/total_damage",       total_damage)
+            self.logger.record("noita/orbs_collected",     int(info.get("noita/orbs_collected", 0)))
+            self.logger.record("noita/biomes_reached",     int(info.get("noita/biomes_reached", 0)))
+            self.logger.record("noita/deepest_biome_idx",  int(info.get("noita/deepest_biome_idx", 0)))
 
             # W&B per-episode
             if self._cfg.wandb_enabled and _WANDB_OK and wandb.run is not None:
@@ -770,3 +812,4 @@ class NoitaMonitorCallback(BaseCallback):
             logger.info("Learning rate changed to {}", val)
         except Exception:
             self._tg.send_text("⚠️ Usage: <code>/lr 0.0001</code>")
+

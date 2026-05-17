@@ -190,7 +190,7 @@ local ACTION_DECODE = {
     [16]= { 0, false, true,  2,  0,  0, false, false }, -- Auto-aim enemy
     [17]= { 0, false, true,  3,  0,  0, false, false }, -- Smart-aim loot
 }
-local MAX_EP_STEPS    = 2000  -- ~2.2 min at 60 fps with FRAME_SKIP=4
+local MAX_EP_STEPS    = 5000  -- ~5.5 min at 60 fps with FRAME_SKIP=4; longer for biome-to-biome runs
 
 -- ── Episode tracking ──────────────────────────────────────────────────────
 -- spawn_candidates accumulates good "anchor" positions; respawn picks one at random
@@ -970,6 +970,18 @@ function OnWorldPostUpdate()
     -- Only run on action frames (frame % FRAME_SKIP == 0) to keep cost low.
     auto_open_chests(player, x, y)
 
+    -- Biome detection — for milestone rewards on the Python side.
+    -- BiomeMapGetName() returns a string like "coalmine", "snowcave", etc.
+    -- Pcall guards against nil/empty returns on the surface or in unloaded chunks.
+    local biome_name = ""
+    local ok_bm, bm = pcall(BiomeMapGetName, x, y)
+    if ok_bm and bm and type(bm) == "string" then biome_name = bm end
+
+    -- Orb count this run = proxy for boss defeats.
+    local orb_count = 0
+    local ok_orb, oc = pcall(GameGetOrbCountThisRun)
+    if ok_orb and oc then orb_count = oc end
+
     -- Current gold and kill count for reward tracking in Python
     local gold = 0
     local wallet = EntityGetFirstComponent(player, "WalletComponent")
@@ -1014,6 +1026,7 @@ function OnWorldPostUpdate()
             jetpack_fuel=1.0, wand_ready=1.0,
             is_on_fire=0.0, is_poisoned=0.0, sky_visibility=sky_visibility,
             gold=gold, kills=kills, chests=chests_opened_ep,
+            biome=biome_name, orbs=orb_count,
             dead=true, on_ground=false, frame=frame
         }
         local ok4, encoded = pcall(json.encode, dead_state)
@@ -1041,6 +1054,7 @@ function OnWorldPostUpdate()
         is_on_fire=is_on_fire, is_poisoned=is_poisoned,
         sky_visibility=sky_visibility, gold=gold, kills=kills,
         chests=chests_opened_ep,
+        biome=biome_name, orbs=orb_count,
         dead=false, on_ground=on_ground, frame=frame,
         cam_x=cam_x, cam_y=cam_y, cam_w=cb_w, cam_h=cb_h,
     }

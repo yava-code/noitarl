@@ -298,6 +298,7 @@ class TelegramNotifier:
             client = Groq(api_key=groq_key)
             
             prompt = (
+                "Старайся отвечать по русски'.\n"
                 "You are an expert AI Analyst for a Reinforcement Learning project 'NoitaRL'.\n"
                 "A PPO agent is learning to play Noita, a physics-based roguelite.\n"
                 "You are provided with a 'mini-MCP' data dump including recent metrics, logs, "

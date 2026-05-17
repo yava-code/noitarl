@@ -78,6 +78,7 @@
 
 **Goal:** visually compelling, demonstrably intelligent behaviour.
 
+- [ ] **Improve video recording quality** — the current video recordings during gameplay need better resolution/framerate.
 - [ ] **Polish HUD** — add a live reward graph drawn in the HUD using multiple GuiText rows
       (simple bar chart of last 30 episode rewards).
 - [ ] **Evaluation script** `eval.py` — load a saved model and run it in deterministic mode

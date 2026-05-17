@@ -29,6 +29,8 @@ from config import Config
 from noita_env import NoitaEnv
 from notify import TelegramNotifier
 from video_recorder import VideoRecorder
+from azure_telemetry import AzureTelemetry
+from azure_callback import AzureCheckpointCallback
 
 
 def make_env(port: int):
@@ -74,7 +76,10 @@ def train(n_envs: int, base_port: int, total_steps: int, resume: str | None, fre
     notifier = TelegramNotifier(cfg.telegram_token, cfg.telegram_chat_id)
     notifier.start_polling()
 
+    telemetry = AzureTelemetry(cfg)
+
     recorder = VideoRecorder(notifier, groq_api_key=cfg.groq_api_key)
+    recorder.set_telemetry(telemetry)
     recorder.start()
 
     ports = [base_port + i for i in range(n_envs)]
@@ -90,14 +95,16 @@ def train(n_envs: int, base_port: int, total_steps: int, resume: str | None, fre
     # Note: SubprocVecEnv forks processes so set_recorder can't propagate.
     # Per-step triggers come from callbacks instead (episode-level).
 
-    monitor_cb    = NoitaMonitorCallback(cfg, notifier, recorder=recorder)
+    monitor_cb    = NoitaMonitorCallback(cfg, notifier, recorder=recorder,
+                                          telemetry=telemetry)
     checkpoint_cb = CheckpointCallback(
         save_freq   = max(cfg.checkpoint_freq // n_envs, 1),
         save_path   = cfg.checkpoint_dir,
         name_prefix = f"noita_ppo_{n_envs}env",
         verbose     = 1,
     )
-    callbacks = CallbackList([monitor_cb, checkpoint_cb])
+    azure_ckpt_cb = AzureCheckpointCallback(telemetry, checkpoint_dir=cfg.checkpoint_dir)
+    callbacks = CallbackList([monitor_cb, checkpoint_cb, azure_ckpt_cb])
 
     if cfg.resume_from:
         logger.info("Resuming from {}", cfg.resume_from)
@@ -109,6 +116,9 @@ def train(n_envs: int, base_port: int, total_steps: int, resume: str | None, fre
                 cfg.resume_from = None
             else:
                 raise
+        except Exception as exc:
+            logger.error("Failed to load checkpoint (corrupted?): {} — starting fresh. ({})", cfg.resume_from, exc)
+            cfg.resume_from = None
     if not cfg.resume_from:
         try:
             import torch
@@ -161,6 +171,8 @@ def train(n_envs: int, base_port: int, total_steps: int, resume: str | None, fre
         out = os.path.join(cfg.checkpoint_dir, f"{run_name}_final")
         model.save(out)
         logger.info("Saved → {}.zip", out)
+        telemetry.upload_file_as_asset(f"checkpoints/{run_name}_final.zip", out + ".zip")
+        telemetry.shutdown()
         notifier.stop()
 
 

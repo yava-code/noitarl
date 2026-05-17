@@ -267,6 +267,11 @@ class NoitaEnv(gym.Env):
         self._post_portal_steps: int = 0  # suppress entry-portal proximity reward
         self._hm_grace_steps: int   = 0   # suppress descent-based truncation in HM
 
+        # Linear playthrough tracking
+        self.last_orbs: int = 0
+        self.last_biome: str = ""
+        self._biomes_reached: set = set()  # depth indices of biomes already rewarded this ep
+
         # Per-step event-detection state for VideoRecorder
         self._fast_mv_counter = 0        # consecutive steps with |vx|>120
         self._long_survival_triggered = False   # fires once per episode at step 600
@@ -593,6 +598,9 @@ class NoitaEnv(gym.Env):
         self._hm_grace_steps          = 0
         self._fast_mv_counter         = 0
         self._long_survival_triggered = False
+        self.last_orbs                = 0
+        self.last_biome               = ""
+        self._biomes_reached          = set()
         self._frame_buf.clear()        # CV: drop stale frames between episodes
 
         logger.debug("[env:{}] reset() — episode {}", self.port, self.episode_num)
@@ -704,7 +712,7 @@ class NoitaEnv(gym.Env):
         #    going DOWN over going sideways at the same speed.
         r_depth = 0.0
         if current_y > self.max_depth_y:
-            r_depth = (current_y - self.max_depth_y) * 0.03
+            r_depth = (current_y - self.max_depth_y) * 0.05   # 0.03 → 0.05 for stronger descent pull
             self.max_depth_y = current_y
             self.steps_without_descent = 0
         else:
@@ -826,15 +834,55 @@ class NoitaEnv(gym.Env):
         if dead and current_hp <= 0:
             r_death = -1.0
 
+        # 7. Biome milestone — large one-shot reward for entering each new, deeper biome.
+        # Rewards the agent for progressing through Noita's linear biome sequence.
+        # Biome names come from BiomeMapGetName(x,y) in init.lua.
+        # Ordering: coalmine=1 (Mines), snowcave=2 (Snowy Depths), rainforest=3 (Jungle),
+        #           vault=4 (Vault), castle=5 (Temple), the_work=6 (The Work / finish).
+        _BIOME_DEPTH: dict = {
+            "coalmine":        1, "coalmine_alt":    1,
+            "snowcave":        2, "snowcastle":       2,
+            "rainforest":      3, "rainforest_open":  3,
+            "hiisi":           3,  # Hiisi Base maps to same depth band as jungle
+            "vault":           4, "vault_frozen":    4,
+            "castle":          5, "castle_overgrown": 5,
+            "the_work_moon":   6, "the_work":        6,
+        }
+        r_biome = 0.0
+        current_biome = str(state.get("biome", "") or "").lower().strip()
+        if current_biome:
+            biome_idx = _BIOME_DEPTH.get(current_biome, 0)
+            if biome_idx > 0 and biome_idx not in self._biomes_reached:
+                self._biomes_reached.add(biome_idx)
+                r_biome = 50.0 * biome_idx   # 50, 100, 150 … 300 for each milestone
+                logger.info(
+                    "[env:{}] Biome milestone! {} (idx={}) → +{:.0f}",
+                    self.port, current_biome, biome_idx, r_biome,
+                )
+        self.last_biome = current_biome
+
+        # 8. Orb collection — proxy for boss defeat. Each orb collected this run is
+        # a boss killed or a major exploration milestone in Noita's progression.
+        r_orbs = 0.0
+        current_orbs = int(state.get("orbs", 0) or 0)
+        if current_orbs > self.last_orbs:
+            r_orbs = (current_orbs - self.last_orbs) * 100.0
+            logger.info(
+                "[env:{}] Orb collected! {} → {} (+{:.0f})",
+                self.port, self.last_orbs, current_orbs, r_orbs,
+            )
+        self.last_orbs = current_orbs
+
         reward = (r_time + r_manh + r_depth + r_down_bias + r_chunk + r_dig
                   + r_trunc + r_dmg + r_kills + r_chests + r_fire + r_waste
-                  + r_portal + r_death)
+                  + r_portal + r_death + r_biome + r_orbs)
 
         # Accumulate per-episode reward totals (sent at episode end for /plot analysis)
         for _k, _v in (("time", r_time), ("manh", r_manh), ("depth", r_depth),
                        ("down", r_down_bias), ("chunk", r_chunk), ("dig", r_dig),
                        ("fire", r_fire), ("waste", r_waste), ("portal", r_portal),
-                       ("kills", r_kills), ("dmg", r_dmg), ("death", r_death), ("trunc", r_trunc)):
+                       ("kills", r_kills), ("dmg", r_dmg), ("death", r_death),
+                       ("trunc", r_trunc), ("biome", r_biome), ("orbs", r_orbs)):
             self._ep_breakdown[_k] = self._ep_breakdown.get(_k, 0.0) + _v
 
         # Debug: log reward breakdown every 50 steps so we can see what's driving the policy
@@ -965,6 +1013,9 @@ class NoitaEnv(gym.Env):
                 "noita/route_y":                self.route_y,
                 "noita/visually_stuck":         visually_stuck,
                 "noita/action_loop":            action_loop,
+                "noita/orbs_collected":         int(self.last_orbs),
+                "noita/biomes_reached":         len(self._biomes_reached),
+                "noita/deepest_biome_idx":      max(self._biomes_reached, default=0),
                 "noita/reward_breakdown": dict(self._ep_breakdown),  # cumulative episode totals
                 "noita/action_history": self.action_history,
             }

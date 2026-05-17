@@ -144,10 +144,15 @@ class VideoRecorder:
 
         self._running = False
         self._threads: list[threading.Thread] = []
+        self._tel = None   # AzureTelemetry | None, injected via set_telemetry()
 
         os.makedirs(self.SAVE_DIR, exist_ok=True)
 
     # ── Public API ────────────────────────────────────────────────────────────
+
+    def set_telemetry(self, telemetry) -> None:
+        """Inject AzureTelemetry after construction so GIFs are uploaded to Blob."""
+        self._tel = telemetry
 
     def start(self) -> None:
         self._running = True
@@ -477,6 +482,11 @@ class VideoRecorder:
             logger.info("VideoRecorder: saved {} ({:.1f} MB)", gif_path, len(gif_bytes) / 1e6)
         except Exception as exc:
             logger.warning("VideoRecorder: save failed: {}", exc)
+
+        # Upload GIF to Azure Blob Storage (non-blocking)
+        if self._tel is not None:
+            blob_name = f"gifs/{event_name}_{ts}.gif"
+            self._tel.upload_asset(blob_name, gif_bytes)
 
         if not _send_to_tg:
             self._cleanup_local_storage()

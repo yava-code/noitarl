@@ -211,6 +211,7 @@ python train_multi.py --envs 2 --resume checkpoints/noita_ppo_2env_400000_steps.
   intended action actually became a `vx/vy` change on the physics tick.
 - **Each game restart re-rolls the world seed.** Long-term curricula must
   account for this — there is no "save and resume in same level" path.
+- **Video Recording Quality**: Need to improve the quality of video recordings (TODO).
 
 ## Key Noita API facts (for future agents)
 
@@ -230,6 +231,68 @@ python train_multi.py --envs 2 --resume checkpoints/noita_ppo_2env_400000_steps.
 
 ---
 
+## Dev-notes protocol (mandatory)
+
+Every development session, architectural change, bug fix, or experiment MUST be logged.
+
+**Rules (enforced):**
+- Create a file in `/dev_notes/YYYY-MM-DD.md` before making any code change.
+- Document: what you intend to change, why, and the expected outcome.
+- After making changes, append: what actually changed and initial results/observations.
+- You are **forbidden** from committing or applying code changes without a corresponding dev_notes entry for that session.
+
+File naming: `dev_notes/2026-05-17.md`, `dev_notes/2026-05-18.md`, etc.
+
+---
+
+## Azure Telemetry Pipeline
+
+The training pipeline ships a zero-blocking, asynchronous telemetry system (`azure_telemetry.py`).
+
+### What is logged
+- **Per step (buffered in RAM):** session_id, episode, global_step, obs (60 floats), action, reward, done
+- **Per episode (flushed at end):** full step buffer as compressed JSONL → Azure Blob Storage; episode summary JSON → Azure Cosmos DB
+- **Assets:** model checkpoints (.zip), GIF recordings → Azure Blob Storage (`noita-assets` container)
+
+### Azure services used (free-tier safe)
+| Service | Usage | Free tier |
+|---------|-------|-----------|
+| Azure Cosmos DB (serverless) | Episode summary documents | 1000 RU/s, 25 GB |
+| Azure Blob Storage | Step JSONL.gz + checkpoints + GIFs | 5 GB LRS |
+
+### Setup
+Add to your `.env` file:
+```env
+AZURE_COSMOS_URL=https://your-account.documents.azure.com:443/
+AZURE_COSMOS_KEY=your-primary-key==
+AZURE_COSMOS_DB=noitarl
+AZURE_COSMOS_CONTAINER=episodes
+AZURE_BLOB_CONNECTION_STRING=DefaultEndpointsProtocol=https;AccountName=...
+AZURE_BLOB_CONTAINER_STEPS=noita-steps
+AZURE_BLOB_CONTAINER_ASSETS=noita-assets
+```
+
+Install SDK:
+```bash
+pip install azure-cosmos azure-storage-blob
+```
+
+When credentials are absent, telemetry silently no-ops — training proceeds normally.
+
+### Architecture
+```
+NoitaMonitorCallback._on_step()
+  ├─ telemetry.log_step(step_data)     # O(1), queue.put, never blocks
+  └─ (episode end) telemetry.flush_episode(info)  # queues work, never blocks
+
+AzureTelemetry._worker (background thread)
+  ├─ batch JSONL.gz → BlobServiceClient.upload_blob()
+  ├─ episode doc    → CosmosClient.upsert_item()
+  └─ asset upload   → BlobServiceClient.upload_blob()
+```
+
+---
+
 ## Dependencies
 
 ```
@@ -238,9 +301,11 @@ gymnasium
 stable-baselines3[extra]
 websockets
 numpy
+azure-cosmos
+azure-storage-blob
 ```
 
 Install:
 ```bash
-pip install stable-baselines3[extra] websockets gymnasium
+pip install stable-baselines3[extra] websockets gymnasium azure-cosmos azure-storage-blob
 ```

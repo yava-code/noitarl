@@ -29,6 +29,8 @@ from config import Config
 from noita_env import NoitaEnv
 from notify import TelegramNotifier
 from video_recorder import VideoRecorder
+from azure_telemetry import AzureTelemetry
+from azure_callback import AzureCheckpointCallback
 
 console = Console()
 
@@ -121,8 +123,12 @@ def train(args: argparse.Namespace) -> None:
     notifier = TelegramNotifier(cfg.telegram_token, cfg.telegram_chat_id)
     notifier.start_polling()
 
+    # ── Azure telemetry ────────────────────────────────────────────────────────
+    telemetry = AzureTelemetry(cfg)
+
     # ── Video recorder ────────────────────────────────────────────────────────
     recorder = VideoRecorder(notifier, groq_api_key=cfg.groq_api_key)
+    recorder.set_telemetry(telemetry)
     recorder.start()
 
     # ── Environment ───────────────────────────────────────────────────────────
@@ -145,6 +151,10 @@ def train(args: argparse.Namespace) -> None:
                 cfg.resume_from = None
             else:
                 raise
+        except Exception as exc:
+            logger.error("Failed to load checkpoint {} (corrupted?): {}", cfg.resume_from, exc)
+            logger.info("Ignoring corrupted checkpoint and starting fresh.")
+            cfg.resume_from = None
     if not cfg.resume_from:
         try:
             import torch
@@ -187,7 +197,8 @@ def train(args: argparse.Namespace) -> None:
 
     # ── Callbacks ─────────────────────────────────────────────────────────────
     from callbacks import NoitaMonitorCallback, ThinkingCallback
-    monitor_cb = NoitaMonitorCallback(cfg, notifier, verbose=0, recorder=recorder)
+    monitor_cb = NoitaMonitorCallback(cfg, notifier, verbose=0, recorder=recorder,
+                                      telemetry=telemetry)
     thinking_cb = ThinkingCallback()
 
     checkpoint_cb = CheckpointCallback(
@@ -196,8 +207,9 @@ def train(args: argparse.Namespace) -> None:
         name_prefix = f"noita_ppo_{run_name}",
         verbose     = 1,
     )
+    azure_ckpt_cb = AzureCheckpointCallback(telemetry, checkpoint_dir=cfg.checkpoint_dir)
 
-    callbacks = CallbackList([monitor_cb, thinking_cb, checkpoint_cb])
+    callbacks = CallbackList([monitor_cb, thinking_cb, checkpoint_cb, azure_ckpt_cb])
 
     # ── Train ─────────────────────────────────────────────────────────────────
     console.rule(f"[bold green]NoitaRL — {run_name}")
@@ -228,6 +240,8 @@ def train(args: argparse.Namespace) -> None:
         out = os.path.join(cfg.checkpoint_dir, f"{run_name}_final")
         model.save(out)
         logger.info("Model saved → {}.zip", out)
+        telemetry.upload_file_as_asset(f"checkpoints/{run_name}_final.zip", out + ".zip")
+        telemetry.shutdown()
         notifier.stop()
 
         if cfg.wandb_enabled:
