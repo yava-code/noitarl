@@ -1,3 +1,10 @@
+
+
+https://github.com/user-attachments/assets/b5d99449-3ead-447d-965a-2d14676631f5
+
+
+
+
 # 🧙‍♂️ Noita RL — Reinforcement Learning Agent for Noita
 
 [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://python.org)
